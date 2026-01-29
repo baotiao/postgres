@@ -54,6 +54,7 @@
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/dwbuf.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -4496,6 +4497,20 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	bufToWrite = PageSetChecksumCopy((Page) bufBlock, buf->tag.blockNum);
 
 	io_start = pgstat_prepare_io_time(track_io_timing);
+
+	/*
+	 * If double write buffer is enabled, write the page to DWB first.
+	 * This protects against torn pages without needing full page writes in WAL.
+	 */
+	if (DWBufIsEnabled())
+	{
+		DWBufWritePage(BufTagGetRelFileLocator(&buf->tag),
+					   BufTagGetForkNum(&buf->tag),
+					   buf->tag.blockNum,
+					   bufToWrite,
+					   recptr);
+		DWBufFlush();
+	}
 
 	/*
 	 * bufToWrite is either the shared buffer or a copy, as appropriate.

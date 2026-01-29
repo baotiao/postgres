@@ -770,6 +770,24 @@
   check_hook => 'check_default_with_oids',
 },
 
+
+{ name => 'double_write_buffer', type => 'bool', context => 'PGC_POSTMASTER', group => 'WAL_SETTINGS',
+  short_desc => 'Enables double write buffer for torn page protection.',
+  long_desc => 'When enabled, pages are written to a double write buffer before being written to data files. This provides protection against torn pages without needing full page writes in WAL.',
+  variable => 'double_write_buffer',
+  boot_val => 'false',
+},
+
+{ name => 'double_write_buffer_size', type => 'int', context => 'PGC_POSTMASTER', group => 'WAL_SETTINGS',
+  short_desc => 'Sets the size of the double write buffer.',
+  long_desc => 'Size of the double write buffer in megabytes. Larger values allow more pages to be batched before flushing.',
+  variable => 'double_write_buffer_size',
+  boot_val => '64',
+  min => '1',
+  max => '1024',
+  unit => 'MB',
+},
+
 { name => 'dynamic_library_path', type => 'string', context => 'PGC_SUSET', group => 'CLIENT_CONN_OTHER',
   short_desc => 'Sets the path for dynamically loadable modules.',
   long_desc => 'If a dynamically loadable module needs to be opened and the specified name does not have a directory component (i.e., the name does not contain a slash), the system will search this path for the specified file.',
