@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Skill(humanizer-zh)",
+      "Bash(/data/baotiao/postgres/bin/bin/psql:*)",
+      "Bash(/data/baotiao/postgres/bin/bin/pg_ctl:*)",
+      "Bash(cat:*)",
+      "Bash(make:*)",
+      "Bash(make install:*)",
+      "Bash(# 查看日志文件 ls -la /tmp/dwb_test/log/ # 查看最新的日志内容 cat /tmp/dwb_test/log/postgresql-*.log)",
+      "Bash(__NEW_LINE_77c4dfbfc8b69572__ /data/baotiao/postgres/bin/bin/psql -h /tmp -p 15432 -d postgres -c \"\nDROP TABLE IF EXISTS test_flush;\nCREATE TABLE test_flush \\(id int\\);\nINSERT INTO test_flush SELECT generate_series\\(1, 1000\\);\nCHECKPOINT;\n\")",
+      "Bash(__NEW_LINE_77c4dfbfc8b69572__ sleep 1)",
+      "Bash(echo:*)",
+      "Bash(__NEW_LINE_65ede60b14cab4b2__ echo \"=== DWB ON Performance Test ===\")",
+      "Bash(/data/baotiao/postgres/bin/bin/pgbench:*)",
+      "Bash(# 停止旧实例 /data/baotiao/postgres/bin/bin/pg_ctl -D /tmp/dwb_test stop || true # 在真实磁盘上创建新实例 rm -rf /data/baotiao/dwb_test_real /data/baotiao/postgres/bin/bin/initdb -D /data/baotiao/dwb_test_real 2>&1)",
+      "Bash(# 验证 DWB 目录 ls -la /data/baotiao/dwb_test_real/pg_dwbuf/ || echo \"\"DWB directory not created yet\"\" # 初始化 pgbench /data/baotiao/postgres/bin/bin/pgbench -h /tmp -p 15433 -i -s 10 postgres 2>&1)",
+      "Bash(ls:*)",
+      "Bash(/data/baotiao/postgres/bin/bin/postgres:*)",
+      "Bash(/data/baotiao/postgres/bin/bin/createdb:*)",
+      "Bash(sysbench:*)"
+    ]
+  }
+}
