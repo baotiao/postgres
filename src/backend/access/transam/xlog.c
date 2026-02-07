@@ -847,9 +847,12 @@ XLogInsertRecord(XLogRecData *rdata,
 			RedoRecPtr = Insert->RedoRecPtr;
 		}
 		/*
-		 * If DWB is enabled, we don't need full page writes.
+		 * If DWB is enabled and no backup is running, we don't need full
+		 * page writes — DWB provides torn page protection.  But during
+		 * backups, FPW must stay on because pg_basebackup doesn't copy
+		 * DWB files, so the standby has no DWB to recover from.
 		 */
-		if (DWBufIsEnabled())
+		if (DWBufIsEnabled() && Insert->runningBackups == 0)
 			doPageWrites = false;
 		else
 			doPageWrites = (Insert->fullPageWrites || Insert->runningBackups > 0);
@@ -5876,6 +5879,9 @@ StartupXLOG(void)
 		 */
 		ResetUnloggedRelations(UNLOGGED_RELATION_CLEANUP);
 
+		/* Scan DWB files and build recovery hash for torn page recovery */
+		DWBufRecoveryInit();
+
 		/*
 		 * Likewise, delete any saved transaction snapshot files that got left
 		 * behind by crashed backends.
@@ -5962,6 +5968,7 @@ StartupXLOG(void)
 	 * Finish WAL recovery.
 	 */
 	endOfRecoveryInfo = FinishWalRecovery();
+	DWBufRecoveryFinish();		/* clean up DWB recovery hash */
 	EndOfLog = endOfRecoveryInfo->endOfLog;
 	EndOfLogTLI = endOfRecoveryInfo->endOfLogTLI;
 	abortedRecPtr = endOfRecoveryInfo->abortedRecPtr;
@@ -6601,8 +6608,9 @@ GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 {
 	*RedoRecPtr_p = RedoRecPtr;
 	/*
-	 * If double write buffer is enabled, we don't need full page writes
-	 * because DWB provides torn page protection.
+	 * If DWB is enabled, hint that FPW is not needed.  This is only a
+	 * hint — XLogInsertRecord re-checks with the authoritative backup
+	 * state and will re-enable FPW if a backup is running.
 	 */
 	if (DWBufIsEnabled())
 		*doPageWrites_p = false;
@@ -7324,6 +7332,9 @@ CreateCheckPoint(int flags)
 	}
 	pfree(vxids);
 
+	/* Flush all pending DWB writes before checkpoint */
+	DWBufPreCheckpoint();
+
 	CheckPointGuts(checkPoint.redo, flags);
 
 	vxids = GetVirtualXIDsDelayingChkpt(&nvxids, DELAY_CHKPT_COMPLETE);
@@ -7445,6 +7456,9 @@ CreateCheckPoint(int flags)
 	 * Let smgr do post-checkpoint cleanup (eg, deleting old files).
 	 */
 	SyncPostCheckpoint();
+
+	/* Reset DWB for next checkpoint cycle */
+	DWBufPostCheckpoint(recptr);
 
 	/*
 	 * Update the average distance between checkpoints if the prior checkpoint
@@ -7832,6 +7846,9 @@ CreateRestartPoint(int flags)
 	/* Update the process title */
 	update_checkpoint_display(flags, true, false);
 
+	/* Flush all pending DWB writes before checkpoint */
+	DWBufPreCheckpoint();
+
 	CheckPointGuts(lastCheckPoint.redo, flags);
 
 	/*
@@ -7893,6 +7910,9 @@ CreateRestartPoint(int flags)
 		UpdateControlFile();
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* Reset DWB for next checkpoint cycle */
+	DWBufPostCheckpoint(lastCheckPoint.redo);
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the

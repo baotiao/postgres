@@ -3633,10 +3633,56 @@ BufferSync(int flags)
 	binaryheap_build(ts_heap);
 
 	/*
-	 * Iterate through to-be-checkpointed buffers and write the ones (still)
-	 * marked with BM_CHECKPOINT_NEEDED. The writes are balanced between
-	 * tablespaces; otherwise the sorting would lead to only one tablespace
-	 * receiving writes at a time, making inefficient use of the hardware.
+	 * Phase 1 (DWB): If double write buffer is enabled, write all
+	 * checkpoint-dirty pages to DWB first, then batch fsync once.
+	 * This ensures torn page protection before data file writes begin.
+	 */
+	if (DWBufIsEnabled())
+	{
+		char	   *dwb_buf;
+
+		dwb_buf = palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, 0);
+
+		for (i = 0; i < num_to_scan; i++)
+		{
+			BufferDesc *bufHdr;
+			uint64		state;
+			Page		page;
+
+			buf_id = CkptBufferIds[i].buf_id;
+			bufHdr = GetBufferDescriptor(buf_id);
+			state = pg_atomic_read_u64(&bufHdr->state);
+
+			if (!(state & BM_CHECKPOINT_NEEDED))
+				continue;
+			if (state & BM_IO_IN_PROGRESS)
+				continue;		/* being written by someone else */
+
+			/* Copy page content — buffer is readable with shared lock */
+			page = BufHdrGetBlock(bufHdr);
+			memcpy(dwb_buf, page, BLCKSZ);
+
+			DWBufWritePage(BufTagGetRelFileLocator(&bufHdr->tag),
+						   BufTagGetForkNum(&bufHdr->tag),
+						   bufHdr->tag.blockNum,
+						   dwb_buf,
+						   BufferGetLSN(bufHdr));
+		}
+
+		/* Single batch fsync for all DWB writes */
+		DWBufFlush();
+		pfree(dwb_buf);
+
+		/* Tell FlushBuffer to skip per-page DWB writes */
+		DWBufSetCheckpointWritesDone(true);
+	}
+
+	/*
+	 * Phase 2: Iterate through to-be-checkpointed buffers and write the
+	 * ones (still) marked with BM_CHECKPOINT_NEEDED. The writes are
+	 * balanced between tablespaces; otherwise the sorting would lead to
+	 * only one tablespace receiving writes at a time, making inefficient
+	 * use of the hardware.
 	 */
 	num_processed = 0;
 	num_written = 0;
@@ -3707,6 +3753,10 @@ BufferSync(int flags)
 	 * IOContext will always be IOCONTEXT_NORMAL.
 	 */
 	IssuePendingWritebacks(&wb_context, IOCONTEXT_NORMAL);
+
+	/* Clear the checkpoint-writes-done flag */
+	if (DWBufIsEnabled())
+		DWBufSetCheckpointWritesDone(false);
 
 	pfree(per_ts_stat);
 	per_ts_stat = NULL;
@@ -4499,17 +4549,21 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 	/*
-	 * If double write buffer is enabled, write the page to DWB first.
-	 * This protects against torn pages without needing full page writes in WAL.
-	 * DWBufWritePage now includes fsync internally for correctness.
+	 * If double write buffer is enabled and checkpoint has not already
+	 * written this page to DWB, write it now with per-page fsync.
+	 * This protects against torn pages without needing full page writes
+	 * in WAL.
 	 */
-	if (DWBufIsEnabled())
+	if (DWBufIsEnabled() && !DWBufCheckpointWritesDone())
 	{
-		DWBufWritePage(BufTagGetRelFileLocator(&buf->tag),
-					   BufTagGetForkNum(&buf->tag),
-					   buf->tag.blockNum,
-					   bufToWrite,
-					   recptr);
+		int			dwb_file_idx;
+
+		dwb_file_idx = DWBufWritePage(BufTagGetRelFileLocator(&buf->tag),
+									  BufTagGetForkNum(&buf->tag),
+									  buf->tag.blockNum,
+									  bufToWrite,
+									  recptr);
+		DWBufFlushFile(dwb_file_idx);
 	}
 
 	/*
@@ -8190,6 +8244,30 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 		if (!PageIsVerified((Page) bufdata, tag.blockNum, piv_flags,
 							failed_checksum))
 		{
+			/*
+			 * Page verification failed — try to recover from the
+			 * double write buffer before giving up.
+			 */
+			if (DWBufRecoverPage(BufTagGetRelFileLocator(&tag),
+								 BufTagGetForkNum(&tag),
+								 tag.blockNum,
+								 (char *) bufdata))
+			{
+				/* Re-verify the recovered page */
+				bool	recovered_checksum_failure = false;
+
+				if (PageIsVerified((Page) bufdata, tag.blockNum,
+								   piv_flags, &recovered_checksum_failure))
+				{
+					/* Successfully recovered from DWB */
+					elog(LOG, "recovered torn page %u/%u/%u fork %d block %u from double write buffer",
+						 tag.spcOid, BufTagGetRelFileLocator(&tag).dbOid,
+						 BufTagGetRelFileLocator(&tag).relNumber,
+						 BufTagGetForkNum(&tag), tag.blockNum);
+					goto page_verified;
+				}
+			}
+
 			if (flags & READ_BUFFERS_ZERO_ON_ERROR)
 			{
 				memset(bufdata, 0, BLCKSZ);
@@ -8204,6 +8282,8 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 		}
 		else if (*failed_checksum)
 			*ignored_checksum = true;
+
+page_verified:
 
 		/* undo what we did above */
 #ifdef USE_VALGRIND

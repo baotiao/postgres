@@ -34,11 +34,11 @@
  */
 typedef struct DWBufPageSlot
 {
+	pg_crc32c		crc;			/* CRC of slot header + page — MUST BE FIRST */
 	RelFileLocator	rlocator;		/* Relation file locator */
 	ForkNumber		forknum;		/* Fork number */
 	BlockNumber		blkno;			/* Block number in relation */
 	XLogRecPtr		lsn;			/* Page LSN at write time */
-	pg_crc32c		crc;			/* CRC of slot header + page content */
 	uint32			slot_id;		/* Slot identifier */
 	uint16			flags;			/* Slot flags */
 	uint16			checksum;		/* Page checksum (if enabled) */
@@ -85,6 +85,7 @@ typedef struct DWBufCtlData
 	uint64			batch_id;		/* Current batch ID */
 	uint64			flushed_batch_id;	/* Last fully flushed batch */
 	XLogRecPtr		checkpoint_lsn;	/* LSN of last checkpoint */
+	bool			resetting;		/* True during PostCheckpoint reset */
 
 	/* Configuration (set at startup) */
 	int				num_slots;		/* Total number of slots */
@@ -117,11 +118,16 @@ extern void DWBufInit(void);
 extern void DWBufClose(void);
 
 /* Write operations */
-extern void DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
-						   BlockNumber blkno, const char *page,
-						   XLogRecPtr lsn);
+extern int DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
+						  BlockNumber blkno, const char *page,
+						  XLogRecPtr lsn);
+extern void DWBufFlushFile(int file_idx);
 extern void DWBufFlush(void);
 extern void DWBufFlushAll(void);
+
+/* Checkpoint batch write support */
+extern void DWBufSetCheckpointWritesDone(bool done);
+extern bool DWBufCheckpointWritesDone(void);
 
 /* Checkpoint integration */
 extern void DWBufPreCheckpoint(void);

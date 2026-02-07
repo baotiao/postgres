@@ -140,6 +140,7 @@ DWBufShmemInit(void)
 		DWBufCtl->batch_id = 0;
 		DWBufCtl->flushed_batch_id = 0;
 		DWBufCtl->checkpoint_lsn = InvalidXLogRecPtr;
+		DWBufCtl->resetting = false;
 	}
 }
 
@@ -306,12 +307,14 @@ DWBufClose(void)
 }
 
 /*
- * Write a page to the double write buffer and fsync.
+ * Write a page to the double write buffer.
  *
- * This function writes the page to DWB and ensures it's fsynced to disk
- * before returning, guaranteeing torn page protection.
+ * Returns the file index that was written to, so the caller can fsync
+ * that specific file if needed (e.g. for non-checkpoint writes).
+ *
+ * Returns -1 if DWB is not enabled.
  */
-void
+int
 DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 			   BlockNumber blkno, const char *page, XLogRecPtr lsn)
 {
@@ -323,7 +326,11 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	pg_crc32c	crc;
 
 	if (!double_write_buffer || DWBufCtl == NULL)
-		return;
+		return -1;
+
+	/* Wait if DWB is being reset by PostCheckpoint */
+	while (DWBufCtl->resetting)
+		pg_usleep(100);
 
 	/* Ensure files are opened in this process */
 	DWBufOpenFiles();
@@ -331,15 +338,23 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	/* Get next slot position atomically */
 	pos = pg_atomic_fetch_add_u64(&DWBufCtl->write_pos, 1);
 
+	/* If DWB is full, flush before overwriting */
+	if (pos >= (uint64) DWBufCtl->num_slots)
+	{
+		DWBufFlush();
+		pos = pos % DWBufCtl->num_slots;
+	}
+
 	/* Calculate file and slot indices */
-	file_idx = (pos / DWBufCtl->slots_per_file) % DWBufCtl->num_files;
-	slot_idx = pos % DWBufCtl->slots_per_file;
+	file_idx = (pos % DWBufCtl->num_slots) / DWBufCtl->slots_per_file;
+	slot_idx = (pos % DWBufCtl->num_slots) % DWBufCtl->slots_per_file;
 
 	/* Calculate offset in file */
 	offset = sizeof(DWBufFileHeader) + (off_t) slot_idx * DWBUF_SLOT_SIZE;
 
 	/* Build slot header in local buffer */
 	slot = (DWBufPageSlot *) dwbuf_page_buffer;
+	slot->crc = 0;				/* zero before CRC computation */
 	slot->rlocator = rlocator;
 	slot->forknum = forknum;
 	slot->blkno = blkno;
@@ -351,7 +366,7 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	/* Copy page data after header */
 	memcpy(dwbuf_page_buffer + sizeof(DWBufPageSlot), page, BLCKSZ);
 
-	/* Compute CRC over slot header and page data */
+	/* Compute CRC over slot header (excluding crc field) and page data */
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, dwbuf_page_buffer + sizeof(pg_crc32c),
 				sizeof(DWBufPageSlot) - sizeof(pg_crc32c) + BLCKSZ);
@@ -365,10 +380,7 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 				(errcode_for_file_access(),
 				 errmsg("could not write to double write buffer: %m")));
 
-	/*
-	 * NOTE: We don't fsync immediately here for performance reasons.
-	 * The DWBufFlush() function will fsync all files before checkpoint.
-	 */
+	return file_idx;
 }
 
 /*
@@ -412,6 +424,30 @@ DWBufFlush(void)
 }
 
 /*
+ * Fsync a single DWB file by index.
+ * Used for per-page fsync in the non-checkpoint write path.
+ */
+void
+DWBufFlushFile(int file_idx)
+{
+	if (!double_write_buffer || DWBufCtl == NULL)
+		return;
+
+	/* Ensure files are opened in this process */
+	if (DWBufFilesOpenedPid != getpid() || DWBufFds[0] < 0)
+		DWBufOpenFiles();
+
+	if (file_idx >= 0 && file_idx < DWBufCtl->num_files && DWBufFds[file_idx] >= 0)
+	{
+		if (pg_fsync(DWBufFds[file_idx]) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not fsync double write buffer file %d: %m",
+							file_idx)));
+	}
+}
+
+/*
  * Flush all pages and ensure DWB is fully synced.
  */
 void
@@ -447,7 +483,6 @@ void
 DWBufPostCheckpoint(XLogRecPtr checkpoint_lsn)
 {
 	int			i;
-	uint64		old_batch_id;
 	uint64		new_batch_id;
 
 	if (!double_write_buffer || DWBufCtl == NULL)
@@ -457,32 +492,33 @@ DWBufPostCheckpoint(XLogRecPtr checkpoint_lsn)
 	if (DWBufFilesOpenedPid != getpid() || DWBufFds[0] < 0)
 		DWBufOpenFiles();
 
+	/*
+	 * Signal writers to wait — prevents new DWBufWritePage calls from
+	 * racing with our reset of write_pos.
+	 */
 	SpinLockAcquire(&DWBufCtl->mutex);
-
-	/* Save old batch ID and increment */
-	old_batch_id = DWBufCtl->batch_id;
-	DWBufCtl->batch_id++;
-	new_batch_id = DWBufCtl->batch_id;
-	DWBufCtl->checkpoint_lsn = checkpoint_lsn;
-
+	DWBufCtl->resetting = true;
 	SpinLockRelease(&DWBufCtl->mutex);
 
 	/*
-	 * Wait for all in-flight writes to complete before resetting write_pos.
-	 * We use batch_id as a synchronization point.
+	 * Wait briefly for any in-flight DWBufWritePage calls to finish their
+	 * pg_pwrite.  They have already obtained their slot position, so we
+	 * just need them to complete the write before we reset positions.
 	 */
-	{
-		uint64 current_pos = pg_atomic_read_u64(&DWBufCtl->write_pos);
-		uint64 num_slots = DWBufCtl->num_slots;
-
-		/* If write_pos wrapped around, wait for flush */
-		if (current_pos >= num_slots)
-			DWBufFlush();
-	}
+	pg_memory_barrier();
+	pg_usleep(1000);	/* 1ms — conservative */
 
 	/* Now safe to reset positions for new batch */
 	pg_atomic_write_u64(&DWBufCtl->write_pos, 0);
 	pg_atomic_write_u64(&DWBufCtl->flush_pos, 0);
+
+	/* Update batch and clear resetting flag */
+	SpinLockAcquire(&DWBufCtl->mutex);
+	DWBufCtl->batch_id++;
+	new_batch_id = DWBufCtl->batch_id;
+	DWBufCtl->checkpoint_lsn = checkpoint_lsn;
+	DWBufCtl->resetting = false;
+	SpinLockRelease(&DWBufCtl->mutex);
 
 	/* Update file headers with new batch info */
 	for (i = 0; i < DWBufCtl->num_files; i++)
@@ -667,7 +703,7 @@ DWBufRecoveryInit(void)
 	pfree(buffer);
 
 	elog(LOG, "double write buffer recovery initialized with %ld pages",
-		 hash_get_num_entries(dwbuf_recovery_hash));
+		 (long) hash_get_num_entries(dwbuf_recovery_hash));
 }
 
 /*
@@ -783,4 +819,30 @@ DWBufGetBatchId(void)
 	SpinLockRelease(&DWBufCtl->mutex);
 
 	return batch_id;
+}
+
+/*
+ * Module-static flag: when true, FlushBuffer skips DWB writes because
+ * checkpoint Phase 1 has already written all pages to DWB and fsynced.
+ */
+static bool dwbuf_checkpoint_writes_done = false;
+
+/*
+ * Set the checkpoint-writes-done flag.
+ * Called by BufferSync to bracket the checkpoint write loop.
+ */
+void
+DWBufSetCheckpointWritesDone(bool done)
+{
+	dwbuf_checkpoint_writes_done = done;
+}
+
+/*
+ * Check if checkpoint DWB writes are already done.
+ * FlushBuffer uses this to skip per-page DWB writes during checkpoint.
+ */
+bool
+DWBufCheckpointWritesDone(void)
+{
+	return dwbuf_checkpoint_writes_done;
 }
