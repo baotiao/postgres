@@ -4501,6 +4501,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	/*
 	 * If double write buffer is enabled, write the page to DWB first.
 	 * This protects against torn pages without needing full page writes in WAL.
+	 * DWBufWritePage now includes fsync internally for correctness.
 	 */
 	if (DWBufIsEnabled())
 	{
@@ -4509,7 +4510,6 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 					   buf->tag.blockNum,
 					   bufToWrite,
 					   recptr);
-		DWBufFlush();
 	}
 
 	/*

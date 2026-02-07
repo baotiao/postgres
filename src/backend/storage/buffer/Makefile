@@ -16,6 +16,7 @@ OBJS = \
 	buf_init.o \
 	buf_table.o \
 	bufmgr.o \
+	dwbuf.o \
 	freelist.o \
 	localbuf.o
 

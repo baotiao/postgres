@@ -40,6 +40,7 @@
 #include "replication/walsender.h"
 #include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
+#include "storage/dwbuf.h"
 #include "storage/dsm.h"
 #include "storage/dsm_registry.h"
 #include "storage/ipc.h"
@@ -141,6 +142,7 @@ CalculateShmemSize(void)
 	size = add_size(size, AioShmemSize());
 	size = add_size(size, WaitLSNShmemSize());
 	size = add_size(size, LogicalDecodingCtlShmemSize());
+	size = add_size(size, DWBufShmemSize());
 
 	/* include additional requested shmem from preload libraries */
 	size = add_size(size, total_addin_request);
@@ -274,6 +276,7 @@ CreateOrAttachShmemStructs(void)
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
 	BufferManagerShmemInit();
+	DWBufShmemInit();
 
 	/*
 	 * Set up lock manager

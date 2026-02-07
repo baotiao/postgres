@@ -53,6 +53,7 @@
 #include "replication/syncrep.h"
 #include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
+#include "storage/dwbuf.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -253,6 +254,11 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 												 "Checkpointer",
 												 ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(checkpointer_context);
+
+	/*
+	 * Initialize double write buffer if enabled.
+	 */
+	DWBufInit();
 
 	/*
 	 * If an exception is encountered, processing resumes here.

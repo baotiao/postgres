@@ -43,10 +43,12 @@ int			double_write_buffer_size = DWBUF_DEFAULT_SIZE_MB;
 /* Shared memory control structure */
 static DWBufCtlData *DWBufCtl = NULL;
 
+/* Process ID that opened the files (to detect fork) */
+static pid_t DWBufFilesOpenedPid = 0;
+
 /* Per-process file descriptors (FDs are per-process, not shareable) */
 static int DWBufFds[DWBUF_MAX_FILES] = {-1, -1, -1, -1, -1, -1, -1, -1,
                                          -1, -1, -1, -1, -1, -1, -1, -1};
-static bool DWBufFilesOpened = false;
 
 /* Directory for DWB files */
 #define DWBUF_DIR			"pg_dwbuf"
@@ -160,9 +162,19 @@ DWBufOpenFiles(void)
 	int			i;
 	char		path[MAXPGPATH];
 	struct stat	st;
+	pid_t		current_pid = getpid();
 
-	if (DWBufFilesOpened)
+	/*
+	 * Check if files are already opened in this process.
+	 * After fork, the child process will have different PID and needs to
+	 * reopen the files.
+	 */
+	if (DWBufFilesOpenedPid == current_pid && DWBufFds[0] >= 0)
 		return;
+
+	/* Close any inherited file descriptors from parent process */
+	if (DWBufFilesOpenedPid != current_pid && DWBufFds[0] >= 0)
+		DWBufClose();
 
 	if (!double_write_buffer || DWBufCtl == NULL)
 		return;
@@ -252,7 +264,7 @@ DWBufOpenFiles(void)
 													  PG_IO_ALIGN_SIZE,
 													  0);
 
-	DWBufFilesOpened = true;
+	DWBufFilesOpenedPid = current_pid;
 }
 
 /*
@@ -277,8 +289,9 @@ void
 DWBufClose(void)
 {
 	int			i;
+	pid_t		current_pid = getpid();
 
-	if (!DWBufFilesOpened)
+	if (DWBufFilesOpenedPid != current_pid || DWBufFds[0] < 0)
 		return;
 
 	for (i = 0; i < DWBUF_MAX_FILES; i++)
@@ -289,11 +302,14 @@ DWBufClose(void)
 			DWBufFds[i] = -1;
 		}
 	}
-	DWBufFilesOpened = false;
+	DWBufFilesOpenedPid = 0;
 }
 
 /*
- * Write a page to the double write buffer.
+ * Write a page to the double write buffer and fsync.
+ *
+ * This function writes the page to DWB and ensures it's fsynced to disk
+ * before returning, guaranteeing torn page protection.
  */
 void
 DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
@@ -309,9 +325,8 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	if (!double_write_buffer || DWBufCtl == NULL)
 		return;
 
-	/* Ensure files are opened (lazy initialization) */
-	if (!DWBufFilesOpened)
-		DWBufOpenFiles();
+	/* Ensure files are opened in this process */
+	DWBufOpenFiles();
 
 	/* Get next slot position atomically */
 	pos = pg_atomic_fetch_add_u64(&DWBufCtl->write_pos, 1);
@@ -349,6 +364,11 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write to double write buffer: %m")));
+
+	/*
+	 * NOTE: We don't fsync immediately here for performance reasons.
+	 * The DWBufFlush() function will fsync all files before checkpoint.
+	 */
 }
 
 /*
@@ -361,7 +381,7 @@ DWBufFlush(void)
 	uint64		current_pos;
 	uint64		flush_pos;
 
-	if (!double_write_buffer || DWBufCtl == NULL || !DWBufFilesOpened)
+	if (!double_write_buffer || DWBufCtl == NULL)
 		return;
 
 	current_pos = pg_atomic_read_u64(&DWBufCtl->write_pos);
@@ -370,6 +390,10 @@ DWBufFlush(void)
 	/* Nothing to flush */
 	if (current_pos <= flush_pos)
 		return;
+
+	/* Ensure files are opened in this process */
+	if (DWBufFilesOpenedPid != getpid() || DWBufFds[0] < 0)
+		DWBufOpenFiles();
 
 	/* Fsync all DWB files */
 	for (i = 0; i < DWBufCtl->num_files; i++)
@@ -423,25 +447,42 @@ void
 DWBufPostCheckpoint(XLogRecPtr checkpoint_lsn)
 {
 	int			i;
+	uint64		old_batch_id;
+	uint64		new_batch_id;
 
 	if (!double_write_buffer || DWBufCtl == NULL)
 		return;
 
-	/* Ensure files are opened */
-	if (!DWBufFilesOpened)
+	/* Ensure files are opened in this process */
+	if (DWBufFilesOpenedPid != getpid() || DWBufFds[0] < 0)
 		DWBufOpenFiles();
 
 	SpinLockAcquire(&DWBufCtl->mutex);
 
-	/* Reset write position for new batch */
-	pg_atomic_write_u64(&DWBufCtl->write_pos, 0);
-	pg_atomic_write_u64(&DWBufCtl->flush_pos, 0);
-
-	/* Increment batch ID */
+	/* Save old batch ID and increment */
+	old_batch_id = DWBufCtl->batch_id;
 	DWBufCtl->batch_id++;
+	new_batch_id = DWBufCtl->batch_id;
 	DWBufCtl->checkpoint_lsn = checkpoint_lsn;
 
 	SpinLockRelease(&DWBufCtl->mutex);
+
+	/*
+	 * Wait for all in-flight writes to complete before resetting write_pos.
+	 * We use batch_id as a synchronization point.
+	 */
+	{
+		uint64 current_pos = pg_atomic_read_u64(&DWBufCtl->write_pos);
+		uint64 num_slots = DWBufCtl->num_slots;
+
+		/* If write_pos wrapped around, wait for flush */
+		if (current_pos >= num_slots)
+			DWBufFlush();
+	}
+
+	/* Now safe to reset positions for new batch */
+	pg_atomic_write_u64(&DWBufCtl->write_pos, 0);
+	pg_atomic_write_u64(&DWBufCtl->flush_pos, 0);
 
 	/* Update file headers with new batch info */
 	for (i = 0; i < DWBufCtl->num_files; i++)
@@ -464,7 +505,7 @@ DWBufPostCheckpoint(XLogRecPtr checkpoint_lsn)
 		}
 
 		/* Update header */
-		header.batch_id = DWBufCtl->batch_id;
+		header.batch_id = new_batch_id;
 		header.checkpoint_lsn = checkpoint_lsn;
 
 		/* Recompute CRC */

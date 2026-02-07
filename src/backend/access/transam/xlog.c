@@ -85,6 +85,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/dwbuf.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -845,7 +846,13 @@ XLogInsertRecord(XLogRecData *rdata,
 			Assert(RedoRecPtr < Insert->RedoRecPtr);
 			RedoRecPtr = Insert->RedoRecPtr;
 		}
-		doPageWrites = (Insert->fullPageWrites || Insert->runningBackups > 0);
+		/*
+		 * If DWB is enabled, we don't need full page writes.
+		 */
+		if (DWBufIsEnabled())
+			doPageWrites = false;
+		else
+			doPageWrites = (Insert->fullPageWrites || Insert->runningBackups > 0);
 
 		if (doPageWrites &&
 			(!prevDoPageWrites ||
@@ -6593,7 +6600,14 @@ void
 GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 {
 	*RedoRecPtr_p = RedoRecPtr;
-	*doPageWrites_p = doPageWrites;
+	/*
+	 * If double write buffer is enabled, we don't need full page writes
+	 * because DWB provides torn page protection.
+	 */
+	if (DWBufIsEnabled())
+		*doPageWrites_p = false;
+	else
+		*doPageWrites_p = doPageWrites;
 }
 
 /*
