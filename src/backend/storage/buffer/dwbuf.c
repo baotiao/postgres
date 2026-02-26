@@ -8,8 +8,8 @@
  * data files. If a crash occurs during a data file write, the page can be
  * recovered from the DWB.
  *
- * This mechanism can replace full_page_writes with better efficiency since
- * it avoids writing full page images to WAL.
+ * This mechanism provides an additional durable page copy that can be
+ * consulted during torn page recovery.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -28,6 +28,7 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "port/pg_crc32c.h"
 #include "storage/dwbuf.h"
 #include "storage/fd.h"
@@ -37,8 +38,47 @@
 #include "utils/memutils.h"
 
 /* GUC variables */
-bool		double_write_buffer = false;
+int			io_torn_pages_protection = TORN_PAGE_PROTECTION_FULL_PAGES;
+bool		double_write_buffer = false;	/* derived from io_torn_pages_protection */
 int			double_write_buffer_size = DWBUF_DEFAULT_SIZE_MB;
+
+/*
+ * GUC enum options for io_torn_pages_protection.
+ */
+const struct config_enum_entry io_torn_pages_protection_options[] = {
+	{"off", TORN_PAGE_PROTECTION_OFF, false},
+	{"full_pages", TORN_PAGE_PROTECTION_FULL_PAGES, false},
+	{"double_writes", TORN_PAGE_PROTECTION_DOUBLE_WRITES, false},
+	{NULL, 0, false}
+};
+
+/*
+ * GUC assign hook for io_torn_pages_protection.
+ *
+ * Derives the internal fullPageWrites and double_write_buffer flags
+ * from the unified enum setting.
+ */
+void
+assign_io_torn_pages_protection(int new_value, void *extra)
+{
+	extern bool fullPageWrites;
+
+	switch (new_value)
+	{
+		case TORN_PAGE_PROTECTION_OFF:
+			fullPageWrites = false;
+			double_write_buffer = false;
+			break;
+		case TORN_PAGE_PROTECTION_FULL_PAGES:
+			fullPageWrites = true;
+			double_write_buffer = false;
+			break;
+		case TORN_PAGE_PROTECTION_DOUBLE_WRITES:
+			fullPageWrites = false;
+			double_write_buffer = true;
+			break;
+	}
+}
 
 /* Shared memory control structure */
 static DWBufCtlData *DWBufCtl = NULL;
@@ -68,6 +108,7 @@ typedef struct DWBufRecoveryEntry
 	/* Data */
 	int				file_idx;		/* Which DWB file */
 	int				slot_idx;		/* Slot index in file */
+	uint32			slot_id;		/* Slot identifier */
 	XLogRecPtr		lsn;			/* Page LSN */
 } DWBufRecoveryEntry;
 
@@ -135,12 +176,13 @@ DWBufShmemInit(void)
 		/* Initialize atomic variables */
 		pg_atomic_init_u64(&DWBufCtl->write_pos, 0);
 		pg_atomic_init_u64(&DWBufCtl->flush_pos, 0);
+		pg_atomic_init_u32(&DWBufCtl->active_writers, 0);
+		pg_atomic_init_u32(&DWBufCtl->resetting, 0);
 
 		/* Initialize other fields */
 		DWBufCtl->batch_id = 0;
 		DWBufCtl->flushed_batch_id = 0;
 		DWBufCtl->checkpoint_lsn = InvalidXLogRecPtr;
-		DWBufCtl->resetting = false;
 	}
 }
 
@@ -328,22 +370,33 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	if (!double_write_buffer || DWBufCtl == NULL)
 		return -1;
 
-	/* Wait if DWB is being reset by PostCheckpoint */
-	while (DWBufCtl->resetting)
-		pg_usleep(100);
-
 	/* Ensure files are opened in this process */
 	DWBufOpenFiles();
+
+	/*
+	 * Coordinate with DWBufPostCheckpoint() reset. Writers that race with reset
+	 * must either fully complete before reset proceeds, or wait until reset is
+	 * finished.
+	 */
+	for (;;)
+	{
+		while (pg_atomic_read_u32(&DWBufCtl->resetting) != 0)
+			pg_usleep(100);
+
+		pg_atomic_fetch_add_u32(&DWBufCtl->active_writers, 1);
+
+		if (pg_atomic_read_u32(&DWBufCtl->resetting) == 0)
+			break;
+
+		pg_atomic_fetch_sub_u32(&DWBufCtl->active_writers, 1);
+	}
 
 	/* Get next slot position atomically */
 	pos = pg_atomic_fetch_add_u64(&DWBufCtl->write_pos, 1);
 
-	/* If DWB is full, flush before overwriting */
+	/* Wrap around when reaching the configured ring capacity. */
 	if (pos >= (uint64) DWBufCtl->num_slots)
-	{
-		DWBufFlush();
 		pos = pos % DWBufCtl->num_slots;
-	}
 
 	/* Calculate file and slot indices */
 	file_idx = (pos % DWBufCtl->num_slots) / DWBufCtl->slots_per_file;
@@ -373,12 +426,27 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	FIN_CRC32C(crc);
 	slot->crc = crc;
 
-	/* Write to DWB file */
-	if (pg_pwrite(DWBufFds[file_idx], dwbuf_page_buffer,
-				  DWBUF_SLOT_SIZE, offset) != DWBUF_SLOT_SIZE)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write to double write buffer: %m")));
+	/* Write to DWB file, tracking IO stats */
+	{
+		instr_time	io_start = pgstat_prepare_io_time(track_io_timing);
+
+		if (pg_pwrite(DWBufFds[file_idx], dwbuf_page_buffer,
+					  DWBUF_SLOT_SIZE, offset) != DWBUF_SLOT_SIZE)
+		{
+			int			save_errno = errno;
+
+			pg_atomic_fetch_sub_u32(&DWBufCtl->active_writers, 1);
+			errno = save_errno;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to double write buffer: %m")));
+		}
+
+		pgstat_count_io_op_time(IOOBJECT_DWBUF, IOCONTEXT_NORMAL, IOOP_WRITE,
+								io_start, 1, DWBUF_SLOT_SIZE);
+	}
+
+	pg_atomic_fetch_sub_u32(&DWBufCtl->active_writers, 1);
 
 	return file_idx;
 }
@@ -412,10 +480,15 @@ DWBufFlush(void)
 	{
 		if (DWBufFds[i] >= 0)
 		{
+			instr_time	io_start = pgstat_prepare_io_time(track_io_timing);
+
 			if (pg_fsync(DWBufFds[i]) != 0)
 				ereport(ERROR,
 						(errcode_for_file_access(),
 						 errmsg("could not fsync double write buffer: %m")));
+
+			pgstat_count_io_op_time(IOOBJECT_DWBUF, IOCONTEXT_NORMAL, IOOP_FSYNC,
+									io_start, 1, 0);
 		}
 	}
 
@@ -439,11 +512,16 @@ DWBufFlushFile(int file_idx)
 
 	if (file_idx >= 0 && file_idx < DWBufCtl->num_files && DWBufFds[file_idx] >= 0)
 	{
+		instr_time	io_start = pgstat_prepare_io_time(track_io_timing);
+
 		if (pg_fsync(DWBufFds[file_idx]) != 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not fsync double write buffer file %d: %m",
 							file_idx)));
+
+		pgstat_count_io_op_time(IOOBJECT_DWBUF, IOCONTEXT_NORMAL, IOOP_FSYNC,
+								io_start, 1, 0);
 	}
 }
 
@@ -492,32 +570,20 @@ DWBufPostCheckpoint(XLogRecPtr checkpoint_lsn)
 	if (DWBufFilesOpenedPid != getpid() || DWBufFds[0] < 0)
 		DWBufOpenFiles();
 
-	/*
-	 * Signal writers to wait — prevents new DWBufWritePage calls from
-	 * racing with our reset of write_pos.
-	 */
-	SpinLockAcquire(&DWBufCtl->mutex);
-	DWBufCtl->resetting = true;
-	SpinLockRelease(&DWBufCtl->mutex);
-
-	/*
-	 * Wait briefly for any in-flight DWBufWritePage calls to finish their
-	 * pg_pwrite.  They have already obtained their slot position, so we
-	 * just need them to complete the write before we reset positions.
-	 */
-	pg_memory_barrier();
-	pg_usleep(1000);	/* 1ms — conservative */
+	/* Block new writers and wait until current writers drain. */
+	pg_atomic_write_u32(&DWBufCtl->resetting, 1);
+	while (pg_atomic_read_u32(&DWBufCtl->active_writers) != 0)
+		pg_usleep(100);
 
 	/* Now safe to reset positions for new batch */
 	pg_atomic_write_u64(&DWBufCtl->write_pos, 0);
 	pg_atomic_write_u64(&DWBufCtl->flush_pos, 0);
 
-	/* Update batch and clear resetting flag */
+	/* Update batch metadata for the new cycle. */
 	SpinLockAcquire(&DWBufCtl->mutex);
 	DWBufCtl->batch_id++;
 	new_batch_id = DWBufCtl->batch_id;
 	DWBufCtl->checkpoint_lsn = checkpoint_lsn;
-	DWBufCtl->resetting = false;
 	SpinLockRelease(&DWBufCtl->mutex);
 
 	/* Update file headers with new batch info */
@@ -559,6 +625,8 @@ DWBufPostCheckpoint(XLogRecPtr checkpoint_lsn)
 							path)));
 		}
 	}
+
+	pg_atomic_write_u32(&DWBufCtl->resetting, 0);
 }
 
 /*
@@ -585,11 +653,18 @@ DWBufRecoveryInit(void)
 	if (!double_write_buffer)
 		return;
 
+	/* Rebuild from disk to ensure we use the latest durable DWB contents. */
+	if (dwbuf_recovery_hash != NULL)
+	{
+		hash_destroy(dwbuf_recovery_hash);
+		dwbuf_recovery_hash = NULL;
+	}
+
 	/* Create hash table for page lookup */
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(DWBufRecoveryKey);
 	hash_ctl.entrysize = sizeof(DWBufRecoveryEntry);
-	hash_ctl.hcxt = CurrentMemoryContext;
+	hash_ctl.hcxt = TopMemoryContext;
 
 	dwbuf_recovery_hash = hash_create("DWBuf Recovery Hash",
 									  1024,
@@ -686,13 +761,16 @@ DWBufRecoveryInit(void)
 
 			entry = hash_search(dwbuf_recovery_hash, &key, HASH_ENTER, &found);
 
-			if (!found || entry->lsn < slot->lsn)
+			if (!found ||
+				entry->lsn < slot->lsn ||
+				(entry->lsn == slot->lsn && entry->slot_id < slot->slot_id))
 			{
 				entry->rlocator = slot->rlocator;
 				entry->forknum = slot->forknum;
 				entry->blkno = slot->blkno;
 				entry->file_idx = i;
 				entry->slot_idx = slot_idx;
+				entry->slot_id = slot->slot_id;
 				entry->lsn = slot->lsn;
 			}
 		}
@@ -702,7 +780,7 @@ DWBufRecoveryInit(void)
 
 	pfree(buffer);
 
-	elog(LOG, "double write buffer recovery initialized with %ld pages",
+	elog(DEBUG1, "double write buffer recovery initialized with %ld pages",
 		 (long) hash_get_num_entries(dwbuf_recovery_hash));
 }
 
@@ -723,6 +801,12 @@ DWBufRecoverPage(RelFileLocator rlocator, ForkNumber forknum,
 	DWBufPageSlot *slot;
 	pg_crc32c	crc;
 
+	/*
+	 * Build a fresh view of durable DWB slots in this process before lookup.
+	 * This function is rare (only on page verification failure), so scanning
+	 * DWB files here is acceptable and ensures backend-local correctness.
+	 */
+	DWBufRecoveryInit();
 	if (dwbuf_recovery_hash == NULL)
 		return false;
 
@@ -764,6 +848,21 @@ DWBufRecoverPage(RelFileLocator rlocator, ForkNumber forknum,
 	FIN_CRC32C(crc);
 
 	if (!EQ_CRC32C(crc, slot->crc))
+	{
+		pfree(buffer);
+		return false;
+	}
+
+	/*
+	 * Validate that this slot still contains exactly the expected page
+	 * identity before using it for repair.
+	 */
+	if (!(slot->flags & DWBUF_SLOT_VALID) ||
+		slot->slot_id != entry->slot_id ||
+		!RelFileLocatorEquals(slot->rlocator, rlocator) ||
+		slot->forknum != forknum ||
+		slot->blkno != blkno ||
+		slot->lsn != entry->lsn)
 	{
 		pfree(buffer);
 		return false;
@@ -819,30 +918,4 @@ DWBufGetBatchId(void)
 	SpinLockRelease(&DWBufCtl->mutex);
 
 	return batch_id;
-}
-
-/*
- * Module-static flag: when true, FlushBuffer skips DWB writes because
- * checkpoint Phase 1 has already written all pages to DWB and fsynced.
- */
-static bool dwbuf_checkpoint_writes_done = false;
-
-/*
- * Set the checkpoint-writes-done flag.
- * Called by BufferSync to bracket the checkpoint write loop.
- */
-void
-DWBufSetCheckpointWritesDone(bool done)
-{
-	dwbuf_checkpoint_writes_done = done;
-}
-
-/*
- * Check if checkpoint DWB writes are already done.
- * FlushBuffer uses this to skip per-page DWB writes during checkpoint.
- */
-bool
-DWBufCheckpointWritesDone(void)
-{
-	return dwbuf_checkpoint_writes_done;
 }

@@ -268,6 +268,8 @@ pgstat_get_io_object_name(IOObject io_object)
 			return "temp relation";
 		case IOOBJECT_WAL:
 			return "wal";
+		case IOOBJECT_DWBUF:
+			return "dwbuf";
 	}
 
 	elog(ERROR, "unrecognized IOObject value: %d", io_object);
@@ -411,6 +413,14 @@ pgstat_tracks_io_object(BackendType bktype, IOObject io_object,
 		return false;
 
 	/*
+	 * IO on IOOBJECT_DWBUF (double write buffer) only occurs in
+	 * IOCONTEXT_NORMAL, performed by checkpointer and backends
+	 * flushing dirty buffers.
+	 */
+	if (io_object == IOOBJECT_DWBUF && io_context != IOCONTEXT_NORMAL)
+		return false;
+
+	/*
 	 * Currently, IO on temporary relations can only occur in the
 	 * IOCONTEXT_NORMAL IOContext.
 	 */
@@ -441,7 +451,18 @@ pgstat_tracks_io_object(BackendType bktype, IOObject io_object,
 	 * rows for all the other objects for these.
 	 */
 	if ((bktype == B_WAL_SUMMARIZER || bktype == B_WAL_RECEIVER ||
-		 bktype == B_WAL_WRITER) && io_object != IOOBJECT_WAL)
+		 bktype == B_WAL_WRITER) &&
+		io_object != IOOBJECT_WAL)
+		return false;
+
+	/*
+	 * Only checkpointer, bgwriter, io workers, and regular backends
+	 * perform DWB IO.
+	 */
+	if (io_object == IOOBJECT_DWBUF &&
+		bktype != B_CHECKPOINTER && bktype != B_BG_WRITER &&
+		bktype != B_IO_WORKER && bktype != B_BACKEND &&
+		bktype != B_STANDALONE_BACKEND)
 		return false;
 
 	/*
@@ -541,6 +562,13 @@ pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 
 	if (io_object == IOOBJECT_WAL && io_context == IOCONTEXT_NORMAL &&
 		!(io_op == IOOP_WRITE || io_op == IOOP_READ || io_op == IOOP_FSYNC))
+		return false;
+
+	/*
+	 * IOOBJECT_DWBUF only tracks IOOP_WRITE and IOOP_FSYNC operations.
+	 */
+	if (io_object == IOOBJECT_DWBUF &&
+		!(io_op == IOOP_WRITE || io_op == IOOP_FSYNC))
 		return false;
 
 	/*

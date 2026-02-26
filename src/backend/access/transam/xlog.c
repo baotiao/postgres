@@ -846,16 +846,7 @@ XLogInsertRecord(XLogRecData *rdata,
 			Assert(RedoRecPtr < Insert->RedoRecPtr);
 			RedoRecPtr = Insert->RedoRecPtr;
 		}
-		/*
-		 * If DWB is enabled and no backup is running, we don't need full
-		 * page writes — DWB provides torn page protection.  But during
-		 * backups, FPW must stay on because pg_basebackup doesn't copy
-		 * DWB files, so the standby has no DWB to recover from.
-		 */
-		if (DWBufIsEnabled() && Insert->runningBackups == 0)
-			doPageWrites = false;
-		else
-			doPageWrites = (Insert->fullPageWrites || Insert->runningBackups > 0);
+		doPageWrites = (Insert->fullPageWrites || Insert->runningBackups > 0);
 
 		if (doPageWrites &&
 			(!prevDoPageWrites ||
@@ -5968,7 +5959,7 @@ StartupXLOG(void)
 	 * Finish WAL recovery.
 	 */
 	endOfRecoveryInfo = FinishWalRecovery();
-	DWBufRecoveryFinish();		/* clean up DWB recovery hash */
+	DWBufRecoveryFinish();		/* clean up startup process recovery map */
 	EndOfLog = endOfRecoveryInfo->endOfLog;
 	EndOfLogTLI = endOfRecoveryInfo->endOfLogTLI;
 	abortedRecPtr = endOfRecoveryInfo->abortedRecPtr;
@@ -6607,15 +6598,7 @@ void
 GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 {
 	*RedoRecPtr_p = RedoRecPtr;
-	/*
-	 * If DWB is enabled, hint that FPW is not needed.  This is only a
-	 * hint — XLogInsertRecord re-checks with the authoritative backup
-	 * state and will re-enable FPW if a backup is running.
-	 */
-	if (DWBufIsEnabled())
-		*doPageWrites_p = false;
-	else
-		*doPageWrites_p = doPageWrites;
+	*doPageWrites_p = doPageWrites;
 }
 
 /*
