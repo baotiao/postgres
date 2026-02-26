@@ -35,14 +35,17 @@ background worker|relation|vacuum
 background worker|temp relation|normal
 background worker|wal|init
 background worker|wal|normal
+background writer|dwbuf|normal
 background writer|relation|init
 background writer|relation|normal
 background writer|wal|init
 background writer|wal|normal
+checkpointer|dwbuf|normal
 checkpointer|relation|init
 checkpointer|relation|normal
 checkpointer|wal|init
 checkpointer|wal|normal
+client backend|dwbuf|normal
 client backend|relation|bulkread
 client backend|relation|bulkwrite
 client backend|relation|init
@@ -51,6 +54,7 @@ client backend|relation|vacuum
 client backend|temp relation|normal
 client backend|wal|init
 client backend|wal|normal
+io worker|dwbuf|normal
 io worker|relation|bulkread
 io worker|relation|bulkwrite
 io worker|relation|init
@@ -67,6 +71,7 @@ slotsync worker|relation|vacuum
 slotsync worker|temp relation|normal
 slotsync worker|wal|init
 slotsync worker|wal|normal
+standalone backend|dwbuf|normal
 standalone backend|relation|bulkread
 standalone backend|relation|bulkwrite
 standalone backend|relation|init
@@ -95,7 +100,7 @@ walsummarizer|wal|init
 walsummarizer|wal|normal
 walwriter|wal|init
 walwriter|wal|normal
-(79 rows)
+(84 rows)
 \a
 -- ensure that both seqscan and indexscan plans are allowed
 SET enable_seqscan TO on;
