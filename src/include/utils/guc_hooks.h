@@ -174,6 +174,7 @@ extern bool check_wal_consistency_checking(char **newval, void **extra,
 extern void assign_wal_consistency_checking(const char *newval, void *extra);
 extern bool check_wal_segment_size(int *newval, void **extra, GucSource source);
 extern void assign_wal_sync_method(int new_wal_sync_method, void *extra);
+extern void assign_io_torn_pages_protection(int new_value, void *extra);
 extern bool check_synchronized_standby_slots(char **newval, void **extra,
 											 GucSource source);
 extern void assign_synchronized_standby_slots(const char *newval, void *extra);

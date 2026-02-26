@@ -846,13 +846,7 @@ XLogInsertRecord(XLogRecData *rdata,
 			Assert(RedoRecPtr < Insert->RedoRecPtr);
 			RedoRecPtr = Insert->RedoRecPtr;
 		}
-		/*
-		 * If DWB is enabled, we don't need full page writes.
-		 */
-		if (DWBufIsEnabled())
-			doPageWrites = false;
-		else
-			doPageWrites = (Insert->fullPageWrites || Insert->runningBackups > 0);
+		doPageWrites = (Insert->fullPageWrites || Insert->runningBackups > 0);
 
 		if (doPageWrites &&
 			(!prevDoPageWrites ||
@@ -5876,6 +5870,9 @@ StartupXLOG(void)
 		 */
 		ResetUnloggedRelations(UNLOGGED_RELATION_CLEANUP);
 
+		/* Scan DWB files and build recovery hash for torn page recovery */
+		DWBufRecoveryInit();
+
 		/*
 		 * Likewise, delete any saved transaction snapshot files that got left
 		 * behind by crashed backends.
@@ -5962,6 +5959,7 @@ StartupXLOG(void)
 	 * Finish WAL recovery.
 	 */
 	endOfRecoveryInfo = FinishWalRecovery();
+	DWBufRecoveryFinish();		/* clean up startup process recovery map */
 	EndOfLog = endOfRecoveryInfo->endOfLog;
 	EndOfLogTLI = endOfRecoveryInfo->endOfLogTLI;
 	abortedRecPtr = endOfRecoveryInfo->abortedRecPtr;
@@ -6600,14 +6598,7 @@ void
 GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 {
 	*RedoRecPtr_p = RedoRecPtr;
-	/*
-	 * If double write buffer is enabled, we don't need full page writes
-	 * because DWB provides torn page protection.
-	 */
-	if (DWBufIsEnabled())
-		*doPageWrites_p = false;
-	else
-		*doPageWrites_p = doPageWrites;
+	*doPageWrites_p = doPageWrites;
 }
 
 /*
@@ -7324,6 +7315,9 @@ CreateCheckPoint(int flags)
 	}
 	pfree(vxids);
 
+	/* Flush all pending DWB writes before checkpoint */
+	DWBufPreCheckpoint();
+
 	CheckPointGuts(checkPoint.redo, flags);
 
 	vxids = GetVirtualXIDsDelayingChkpt(&nvxids, DELAY_CHKPT_COMPLETE);
@@ -7445,6 +7439,9 @@ CreateCheckPoint(int flags)
 	 * Let smgr do post-checkpoint cleanup (eg, deleting old files).
 	 */
 	SyncPostCheckpoint();
+
+	/* Reset DWB for next checkpoint cycle */
+	DWBufPostCheckpoint(recptr);
 
 	/*
 	 * Update the average distance between checkpoints if the prior checkpoint
@@ -7832,6 +7829,9 @@ CreateRestartPoint(int flags)
 	/* Update the process title */
 	update_checkpoint_display(flags, true, false);
 
+	/* Flush all pending DWB writes before checkpoint */
+	DWBufPreCheckpoint();
+
 	CheckPointGuts(lastCheckPoint.redo, flags);
 
 	/*
@@ -7893,6 +7893,9 @@ CreateRestartPoint(int flags)
 		UpdateControlFile();
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* Reset DWB for next checkpoint cycle */
+	DWBufPostCheckpoint(lastCheckPoint.redo);
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the

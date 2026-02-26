@@ -5,8 +5,8 @@
  *
  * The double write buffer provides protection against torn page writes
  * by writing pages to a dedicated buffer file before writing to the
- * actual data files. This can replace full_page_writes for torn page
- * protection with better efficiency.
+ * actual data files. This provides an additional durable copy that can
+ * be used for torn page recovery.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -34,11 +34,11 @@
  */
 typedef struct DWBufPageSlot
 {
+	pg_crc32c		crc;			/* CRC of slot header + page — MUST BE FIRST */
 	RelFileLocator	rlocator;		/* Relation file locator */
 	ForkNumber		forknum;		/* Fork number */
 	BlockNumber		blkno;			/* Block number in relation */
 	XLogRecPtr		lsn;			/* Page LSN at write time */
-	pg_crc32c		crc;			/* CRC of slot header + page content */
 	uint32			slot_id;		/* Slot identifier */
 	uint16			flags;			/* Slot flags */
 	uint16			checksum;		/* Page checksum (if enabled) */
@@ -82,6 +82,8 @@ typedef struct DWBufCtlData
 	/* Current state */
 	pg_atomic_uint64	write_pos;		/* Next slot to write */
 	pg_atomic_uint64	flush_pos;		/* Last flushed position */
+	pg_atomic_uint32	active_writers; /* Number of in-flight writers */
+	pg_atomic_uint32	resetting;		/* 1 during PostCheckpoint reset */
 	uint64			batch_id;		/* Current batch ID */
 	uint64			flushed_batch_id;	/* Last fully flushed batch */
 	XLogRecPtr		checkpoint_lsn;	/* LSN of last checkpoint */
@@ -101,9 +103,24 @@ typedef struct DWBufCtlData
 #define DWBUF_MAX_SIZE_MB		1024
 
 /*
+ * Torn page protection methods.
+ *
+ * Controls how PostgreSQL protects against partial (torn) page writes.
+ * Replaces the legacy full_page_writes boolean and the double_write_buffer
+ * boolean with a single unified setting.
+ */
+typedef enum TornPageProtection
+{
+	TORN_PAGE_PROTECTION_OFF = 0,			/* No protection */
+	TORN_PAGE_PROTECTION_FULL_PAGES = 1,	/* Full page images in WAL */
+	TORN_PAGE_PROTECTION_DOUBLE_WRITES = 2	/* Double write buffer file */
+} TornPageProtection;
+
+/*
  * Global variables
  */
-extern PGDLLIMPORT bool double_write_buffer;
+extern PGDLLIMPORT int io_torn_pages_protection;
+extern PGDLLIMPORT bool double_write_buffer;	/* derived from io_torn_pages_protection */
 extern PGDLLIMPORT int double_write_buffer_size;
 
 /*
@@ -117,9 +134,10 @@ extern void DWBufInit(void);
 extern void DWBufClose(void);
 
 /* Write operations */
-extern void DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
-						   BlockNumber blkno, const char *page,
-						   XLogRecPtr lsn);
+extern int DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
+						  BlockNumber blkno, const char *page,
+						  XLogRecPtr lsn);
+extern void DWBufFlushFile(int file_idx);
 extern void DWBufFlush(void);
 extern void DWBufFlushAll(void);
 

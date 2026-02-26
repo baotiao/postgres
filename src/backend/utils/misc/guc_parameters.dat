@@ -771,21 +771,14 @@
 },
 
 
-{ name => 'double_write_buffer', type => 'bool', context => 'PGC_POSTMASTER', group => 'WAL_SETTINGS',
-  short_desc => 'Enables double write buffer for torn page protection.',
-  long_desc => 'When enabled, pages are written to a double write buffer before being written to data files. This provides protection against torn pages without needing full page writes in WAL.',
-  variable => 'double_write_buffer',
-  boot_val => 'false',
-},
-
 { name => 'double_write_buffer_size', type => 'int', context => 'PGC_POSTMASTER', group => 'WAL_SETTINGS',
   short_desc => 'Sets the size of the double write buffer.',
   long_desc => 'Size of the double write buffer in megabytes. Larger values allow more pages to be batched before flushing.',
   variable => 'double_write_buffer_size',
   boot_val => '64',
-  min => '1',
+  min => '16',
   max => '1024',
-  unit => 'MB',
+  flags => 'GUC_UNIT_MB',
 },
 
 { name => 'dynamic_library_path', type => 'string', context => 'PGC_SUSET', group => 'CLIENT_CONN_OTHER',
@@ -1084,9 +1077,10 @@
   boot_val => 'true',
 },
 
-{ name => 'full_page_writes', type => 'bool', context => 'PGC_SIGHUP', group => 'WAL_SETTINGS',
-  short_desc => 'Writes full pages to WAL when first modified after a checkpoint.',
-  long_desc => 'A page write in process during an operating system crash might be only partially written to disk.  During recovery, the row changes stored in WAL are not enough to recover.  This option writes pages when first modified after a checkpoint to WAL so full recovery is possible.',
+{ name => 'full_page_writes', type => 'bool', context => 'PGC_INTERNAL', group => 'WAL_SETTINGS',
+  short_desc => 'Whether full page images are written to WAL (derived from io_torn_pages_protection).',
+  long_desc => 'This setting is now derived from io_torn_pages_protection and cannot be set directly. When io_torn_pages_protection = full_pages, this is true. Otherwise it is false.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE',
   variable => 'fullPageWrites',
   boot_val => 'true',
 },
@@ -1358,6 +1352,15 @@
   boot_val => 'DEFAULT_IO_METHOD',
   options => 'io_method_options',
   assign_hook => 'assign_io_method',
+},
+
+{ name => 'io_torn_pages_protection', type => 'enum', context => 'PGC_POSTMASTER', group => 'WAL_SETTINGS',
+  short_desc => 'Configures torn page protection method.',
+  long_desc => 'Controls how PostgreSQL protects against torn (partial) page writes during crashes. "full_pages" writes full page images to WAL after each checkpoint (traditional method). "double_writes" uses a double write buffer file for torn page recovery. "off" disables protection (unsafe on filesystems without atomic 8kB writes).',
+  variable => 'io_torn_pages_protection',
+  boot_val => 'TORN_PAGE_PROTECTION_FULL_PAGES',
+  options => 'io_torn_pages_protection_options',
+  assign_hook => 'assign_io_torn_pages_protection',
 },
 
 { name => 'io_workers', type => 'int', context => 'PGC_SIGHUP', group => 'RESOURCES_IO',
