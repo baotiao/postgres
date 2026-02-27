@@ -7441,7 +7441,7 @@ CreateCheckPoint(int flags)
 	SyncPostCheckpoint();
 
 	/* Reset DWB for next checkpoint cycle */
-	DWBufPostCheckpoint(recptr);
+	DWBufPostCheckpoint();
 
 	/*
 	 * Update the average distance between checkpoints if the prior checkpoint
@@ -7895,7 +7895,7 @@ CreateRestartPoint(int flags)
 	LWLockRelease(ControlFileLock);
 
 	/* Reset DWB for next checkpoint cycle */
-	DWBufPostCheckpoint(lastCheckPoint.redo);
+	DWBufPostCheckpoint();
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the

@@ -3545,6 +3545,93 @@ BufferSync(int flags)
 	 */
 	sort_checkpoint_bufferids(CkptBufferIds, num_to_scan);
 
+	/*
+	 * Phase 1 (DWB batch write): If the double write buffer is enabled,
+	 * pre-write all checkpoint-needed pages into the DWB and issue a single
+	 * fsync for all DWB segment files.  This replaces the per-page
+	 * DWBufWritePage + DWBufFlushFile that would otherwise happen inside
+	 * FlushBuffer, dramatically reducing fsync overhead for the checkpointer
+	 * (from one fsync per dirty page down to one fsync per DWB file).
+	 *
+	 * After the batch DWB write, we set a process-local flag so that
+	 * FlushBuffer skips the per-page DWB write during Phase 2 (the normal
+	 * data-file write loop below).
+	 */
+	if (DWBufIsEnabled())
+	{
+		int		dwb_written = 0;
+
+		for (i = 0; i < num_to_scan; i++)
+		{
+			BufferDesc *bufHdr;
+			Block		bufBlock;
+			char	   *bufToWrite;
+			uint64		state;
+
+			buf_id = CkptBufferIds[i].buf_id;
+			bufHdr = GetBufferDescriptor(buf_id);
+
+			/* Quick non-locked check: skip if no longer checkpoint-needed */
+			state = pg_atomic_read_u64(&bufHdr->state);
+			if (!(state & BM_CHECKPOINT_NEEDED) ||
+				!(state & BM_DIRTY) ||
+				!(state & BM_VALID))
+				continue;
+
+			/*
+			 * Pin the buffer so it can't be evicted while we copy its page.
+			 * Use the same pinning protocol as SyncOneBuffer.
+			 */
+			ReservePrivateRefCountEntry();
+			ResourceOwnerEnlarge(CurrentResourceOwner);
+
+			state = LockBufHdr(bufHdr);
+
+			/* Re-check under header lock */
+			if (!(state & BM_VALID) || !(state & BM_DIRTY) ||
+				!(state & BM_CHECKPOINT_NEEDED))
+			{
+				UnlockBufHdr(bufHdr);
+				continue;
+			}
+
+			PinBuffer_Locked(bufHdr);
+
+			/* Shared content lock for a consistent page image */
+			LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_SHARE);
+
+			bufBlock = BufHdrGetBlock(bufHdr);
+			bufToWrite = PageSetChecksumCopy((Page) bufBlock,
+											 bufHdr->tag.blockNum);
+
+			DWBufWritePage(BufTagGetRelFileLocator(&bufHdr->tag),
+						   BufTagGetForkNum(&bufHdr->tag),
+						   bufHdr->tag.blockNum,
+						   bufToWrite,
+						   PageGetLSN((Page) bufBlock));
+
+			LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_UNLOCK);
+			UnpinBuffer(bufHdr);
+
+			dwb_written++;
+
+			/* Check for barrier events */
+			if (ProcSignalBarrierPending)
+				ProcessProcSignalBarrier();
+		}
+
+		/* Single fsync for all DWB segment files */
+		if (dwb_written > 0)
+			DWBufFlush();
+
+		/* Tell FlushBuffer to skip per-page DWB writes in Phase 2 */
+		DWBufSetCheckpointWritesDone(true);
+
+		ereport(DEBUG1,
+				(errmsg("checkpoint DWB phase 1 complete: %d pages written to DWB",
+						dwb_written)));
+	}
+
 	num_spaces = 0;
 
 	/*
@@ -3708,6 +3795,11 @@ BufferSync(int flags)
 	 * IOContext will always be IOCONTEXT_NORMAL.
 	 */
 	IssuePendingWritebacks(&wb_context, IOCONTEXT_NORMAL);
+
+	/* Clear the DWB checkpoint batch flag so future FlushBuffer calls
+	 * (from bgwriter or backend eviction) resume per-page DWB writes. */
+	if (DWBufIsEnabled())
+		DWBufSetCheckpointWritesDone(false);
 
 	pfree(per_ts_stat);
 	per_ts_stat = NULL;
@@ -4500,10 +4592,16 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 	/*
-	 * If double write buffer is enabled, write this page to DWB and fsync
-	 * the corresponding segment before writing the data file page.
+	 * If double write buffer is enabled and we are NOT in the Phase 2 of a
+	 * checkpoint (where DWB pages were already batch-written in Phase 1),
+	 * write this page to the DWB and fsync the corresponding segment before
+	 * writing the data file page.
+	 *
+	 * During a checkpoint, DWBufCheckpointWritesDone() returns true after
+	 * BufferSync's Phase 1 has already written all dirty pages to the DWB
+	 * with a single fsync, so we can skip the per-page DWB write here.
 	 */
-	if (DWBufIsEnabled())
+	if (DWBufIsEnabled() && !DWBufCheckpointWritesDone())
 	{
 		int			dwb_file_idx;
 
@@ -4512,7 +4610,29 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 									  buf->tag.blockNum,
 									  bufToWrite,
 									  recptr);
-		DWBufFlushFile(dwb_file_idx);
+
+		if (dwb_file_idx >= 0)
+		{
+			DWBufFlushFile(dwb_file_idx);
+		}
+		else
+		{
+			/*
+			 * DWB ring buffer is full — this slot would overwrite data not
+			 * yet protected by a completed checkpoint.  Fall back to writing
+			 * a full page image (FPI) to WAL so crash recovery can restore
+			 * this page even if the data file write is torn.
+			 */
+			XLogRecPtr	fpi_lsn;
+			RelFileLocator rlocator = BufTagGetRelFileLocator(&buf->tag);
+
+			fpi_lsn = log_newpage(&rlocator,
+								  BufTagGetForkNum(&buf->tag),
+								  buf->tag.blockNum,
+								  (Page) bufToWrite,
+								  true);
+			XLogFlush(fpi_lsn);
+		}
 	}
 
 	/*

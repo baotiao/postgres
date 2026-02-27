@@ -23,7 +23,6 @@
 #include "storage/relfilelocator.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
-#include "storage/spin.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
 #include "access/xlogdefs.h"
@@ -46,7 +45,6 @@ typedef struct DWBufPageSlot
 
 /* Slot flags */
 #define DWBUF_SLOT_VALID		0x0001	/* Slot contains valid data */
-#define DWBUF_SLOT_FLUSHED		0x0002	/* Slot has been flushed to disk */
 
 /*
  * Double write buffer file header.
@@ -58,8 +56,6 @@ typedef struct DWBufFileHeader
 	uint32			version;		/* Format version */
 	uint32			blcksz;			/* Block size (must match BLCKSZ) */
 	uint32			slots_per_file;	/* Number of slots in this file */
-	uint64			batch_id;		/* Current batch ID */
-	XLogRecPtr		checkpoint_lsn;	/* LSN of last checkpoint */
 	pg_crc32c		crc;			/* CRC of this header */
 } DWBufFileHeader;
 
@@ -67,9 +63,25 @@ typedef struct DWBufFileHeader
 #define DWBUF_VERSION		1
 
 /*
- * Size of each slot in the DWB file (header + page data, aligned)
+ * Size of each slot in the DWB file (header + page data), aligned to
+ * PG_IO_ALIGN_SIZE (typically 4096) for optimal direct I/O performance.
  */
-#define DWBUF_SLOT_SIZE		MAXALIGN(sizeof(DWBufPageSlot) + BLCKSZ)
+#define DWBUF_SLOT_SIZE		TYPEALIGN(PG_IO_ALIGN_SIZE, sizeof(DWBufPageSlot) + BLCKSZ)
+
+/*
+ * File header occupies a full alignment block so that the first slot
+ * starts at a PG_IO_ALIGN_SIZE boundary.
+ */
+#define DWBUF_FILE_HEADER_SIZE	PG_IO_ALIGN_SIZE
+
+/* Maximum number of DWB segment files */
+#define DWBUF_MAX_FILES		16
+
+/* Minimum number of slots (floor applied during size calculation) */
+#define DWBUF_MIN_SLOTS		64
+
+/* Slots per DWB segment file */
+#define DWBUF_SLOTS_PER_FILE	4096
 
 /*
  * Double write buffer shared control structure.
@@ -77,25 +89,38 @@ typedef struct DWBufFileHeader
  */
 typedef struct DWBufCtlData
 {
-	slock_t			mutex;			/* Protects shared state */
-
 	/* Current state */
 	pg_atomic_uint64	write_pos;		/* Next slot to write */
 	pg_atomic_uint64	flush_pos;		/* Last flushed position */
 	pg_atomic_uint32	active_writers; /* Number of in-flight writers */
 	pg_atomic_uint32	resetting;		/* 1 during PostCheckpoint reset */
-	uint64			batch_id;		/* Current batch ID */
-	uint64			flushed_batch_id;	/* Last fully flushed batch */
-	XLogRecPtr		checkpoint_lsn;	/* LSN of last checkpoint */
+
+	/*
+	 * Slot reuse safety.  Records the write_pos at the start of each
+	 * checkpoint.  When write_pos wraps the ring buffer and would reuse a
+	 * slot written since checkpoint_start_pos, DWBufWritePage returns -1
+	 * so the caller falls back to a full page image in WAL.
+	 */
+	pg_atomic_uint64	checkpoint_start_pos;
+
+	/*
+	 * Per-file batch fsync tracking.
+	 *
+	 * Each DWBufWritePage increments file_write_gen for the target file.
+	 * DWBufFlushFile only issues pg_fsync when file_sync_gen < the caller's
+	 * write generation; a single fsync covers all preceding writes.
+	 * file_syncing is 1 while an fsync is in progress to avoid thundering
+	 * herd fsyncs.
+	 */
+	pg_atomic_uint64	file_write_gen[DWBUF_MAX_FILES];
+	pg_atomic_uint64	file_sync_gen[DWBUF_MAX_FILES];
+	pg_atomic_uint32	file_syncing[DWBUF_MAX_FILES];
 
 	/* Configuration (set at startup) */
 	int				num_slots;		/* Total number of slots */
 	int				num_files;		/* Number of segment files */
 	int				slots_per_file;	/* Slots per segment file */
 } DWBufCtlData;
-
-/* Maximum number of DWB segment files */
-#define DWBUF_MAX_FILES		16
 
 /* Default and limits for double_write_buffer_size (in MB) */
 #define DWBUF_DEFAULT_SIZE_MB	64
@@ -139,12 +164,14 @@ extern int DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 						  XLogRecPtr lsn);
 extern void DWBufFlushFile(int file_idx);
 extern void DWBufFlush(void);
-extern void DWBufFlushAll(void);
+
+/* Checkpoint batch write support */
+extern void DWBufSetCheckpointWritesDone(bool done);
+extern bool DWBufCheckpointWritesDone(void);
 
 /* Checkpoint integration */
 extern void DWBufPreCheckpoint(void);
-extern void DWBufPostCheckpoint(XLogRecPtr checkpoint_lsn);
-extern void DWBufReset(void);
+extern void DWBufPostCheckpoint(void);
 
 /* Recovery operations */
 extern void DWBufRecoveryInit(void);
@@ -154,6 +181,5 @@ extern void DWBufRecoveryFinish(void);
 
 /* Utility functions */
 extern bool DWBufIsEnabled(void);
-extern uint64 DWBufGetBatchId(void);
 
 #endif							/* DWBUF_H */
