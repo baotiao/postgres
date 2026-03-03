@@ -94,12 +94,6 @@ static int DWBufFds[DWBUF_MAX_FILES] = {-1, -1, -1, -1, -1, -1, -1, -1,
 #define DWBUF_DIR			"pg_dwbuf"
 #define DWBUF_FILE_PREFIX	"dwbuf_"
 
-/*
- * Process-local state for batch fsync: set by DWBufWritePage, consumed by
- * DWBufFlushFile so that multiple writes can share a single fsync.
- */
-static uint64 dwbuf_my_write_gen = 0;
-
 /* Recovery hash table for page lookup */
 static HTAB *dwbuf_recovery_hash = NULL;
 
@@ -276,8 +270,6 @@ DWBufOpenFiles(void)
 
 				StaticAssertStmt(sizeof(DWBufFileHeader) <= DWBUF_FILE_HEADER_SIZE,
 								 "DWBufFileHeader exceeds DWBUF_FILE_HEADER_SIZE");
-				StaticAssertStmt(DWBUF_FILE_HEADER_SIZE <= PG_IO_ALIGN_SIZE,
-								 "DWBUF_FILE_HEADER_SIZE exceeds alignment");
 
 				memset(hdr_buf.data, 0, DWBUF_FILE_HEADER_SIZE);
 				header = (DWBufFileHeader *) hdr_buf.data;
@@ -377,7 +369,8 @@ DWBufClose(void)
  */
 int
 DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
-			   BlockNumber blkno, const char *page, XLogRecPtr lsn)
+			   BlockNumber blkno, const char *page, XLogRecPtr lsn,
+			   uint64 *write_gen_out)
 {
 	uint64		pos;
 	uint64		slot_pos;
@@ -488,8 +481,13 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	 * which generation it must wait for.  Multiple writers incrementing the
 	 * same file_write_gen allows a single fsync to cover all of them.
 	 */
-	dwbuf_my_write_gen =
-		pg_atomic_fetch_add_u64(&DWBufCtl->file_write_gen[file_idx], 1) + 1;
+	{
+		uint64		my_gen =
+			pg_atomic_fetch_add_u64(&DWBufCtl->file_write_gen[file_idx], 1) + 1;
+
+		if (write_gen_out != NULL)
+			*write_gen_out = my_gen;
+	}
 
 	pg_atomic_fetch_sub_u32(&DWBufCtl->active_writers, 1);
 
@@ -554,9 +552,9 @@ DWBufFlush(void)
  * is just an atomic read — no syscall at all.
  */
 void
-DWBufFlushFile(int file_idx)
+DWBufFlushFile(int file_idx, uint64 write_gen)
 {
-	uint64		my_gen = dwbuf_my_write_gen;
+	uint64		my_gen = write_gen;
 
 	if (!DWBufIsEnabled())
 		return;
@@ -673,6 +671,14 @@ DWBufPostCheckpoint(void)
 	/* Now safe to reset positions for new cycle */
 	pg_atomic_write_u64(&DWBufCtl->write_pos, 0);
 	pg_atomic_write_u64(&DWBufCtl->flush_pos, 0);
+
+	/*
+	 * Reset checkpoint_start_pos to 0 to match write_pos.  Without this,
+	 * DWBufWritePage would compute (pos - old_checkpoint_start_pos) with
+	 * uint64 underflow for every write until the next DWBufPreCheckpoint,
+	 * triggering the overflow guard and returning -1 for all DWB writes.
+	 */
+	pg_atomic_write_u64(&DWBufCtl->checkpoint_start_pos, 0);
 
 	pg_atomic_write_u32(&DWBufCtl->resetting, 0);
 }

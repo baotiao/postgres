@@ -161,8 +161,8 @@ extern void DWBufClose(void);
 /* Write operations */
 extern int DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 						  BlockNumber blkno, const char *page,
-						  XLogRecPtr lsn);
-extern void DWBufFlushFile(int file_idx);
+						  XLogRecPtr lsn, uint64 *write_gen_out);
+extern void DWBufFlushFile(int file_idx, uint64 write_gen);
 extern void DWBufFlush(void);
 
 /* Checkpoint batch write support */
