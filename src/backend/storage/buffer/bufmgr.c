@@ -3560,13 +3560,16 @@ BufferSync(int flags)
 	if (DWBufIsEnabled())
 	{
 		int		dwb_written = 0;
+		int		dwb_fpi_fallback = 0;
 
 		for (i = 0; i < num_to_scan; i++)
 		{
 			BufferDesc *bufHdr;
 			Block		bufBlock;
 			char	   *bufToWrite;
+			XLogRecPtr	page_lsn;
 			uint64		state;
+			int			dwb_rc;
 
 			buf_id = CkptBufferIds[i].buf_id;
 			bufHdr = GetBufferDescriptor(buf_id);
@@ -3597,23 +3600,56 @@ BufferSync(int flags)
 
 			PinBuffer_Locked(bufHdr);
 
-			/* Shared content lock for a consistent page image */
+			/*
+			 * Copy the page while holding the shared content lock.
+			 * PageSetChecksumCopy returns a pointer to a private copy, so
+			 * we can release the lock before doing the DWB I/O, reducing
+			 * contention for concurrent writers on the same pages.
+			 */
 			LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_SHARE);
 
 			bufBlock = BufHdrGetBlock(bufHdr);
 			bufToWrite = PageSetChecksumCopy((Page) bufBlock,
 											 bufHdr->tag.blockNum);
-
-			DWBufWritePage(BufTagGetRelFileLocator(&bufHdr->tag),
-						   BufTagGetForkNum(&bufHdr->tag),
-						   bufHdr->tag.blockNum,
-						   bufToWrite,
-						   PageGetLSN((Page) bufBlock));
+			page_lsn = PageGetLSN((Page) bufBlock);
 
 			LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_UNLOCK);
+
+			/*
+			 * Write page to DWB — no content lock held during I/O.  Pass
+			 * NULL for write_gen_out since Phase 1 uses DWBufFlush() (which
+			 * fsyncs all files at once) rather than DWBufFlushFile().
+			 */
+			dwb_rc = DWBufWritePage(BufTagGetRelFileLocator(&bufHdr->tag),
+									BufTagGetForkNum(&bufHdr->tag),
+									bufHdr->tag.blockNum,
+									bufToWrite,
+									page_lsn,
+									NULL);
+
 			UnpinBuffer(bufHdr);
 
-			dwb_written++;
+			if (dwb_rc < 0)
+			{
+				/*
+				 * DWB ring buffer is full — fall back to a full page image
+				 * in WAL so crash recovery can restore this page even if
+				 * the data-file write is torn.  This mirrors the identical
+				 * fallback in FlushBuffer().
+				 */
+				RelFileLocator rlocator = BufTagGetRelFileLocator(&bufHdr->tag);
+				XLogRecPtr	fpi_lsn;
+
+				fpi_lsn = log_newpage(&rlocator,
+									  BufTagGetForkNum(&bufHdr->tag),
+									  bufHdr->tag.blockNum,
+									  (Page) bufToWrite,
+									  true);
+				XLogFlush(fpi_lsn);
+				dwb_fpi_fallback++;
+			}
+			else
+				dwb_written++;
 
 			/* Check for barrier events */
 			if (ProcSignalBarrierPending)
@@ -3624,12 +3660,16 @@ BufferSync(int flags)
 		if (dwb_written > 0)
 			DWBufFlush();
 
-		/* Tell FlushBuffer to skip per-page DWB writes in Phase 2 */
+		/*
+		 * Tell FlushBuffer to skip per-page DWB writes in Phase 2.  Every
+		 * checkpoint-needed page is now protected by either the DWB batch
+		 * write above or a WAL full page image (FPI fallback for overflow).
+		 */
 		DWBufSetCheckpointWritesDone(true);
 
 		ereport(DEBUG1,
-				(errmsg("checkpoint DWB phase 1 complete: %d pages written to DWB",
-						dwb_written)));
+				(errmsg("checkpoint DWB phase 1 complete: %d pages written to DWB, %d FPI fallbacks",
+						dwb_written, dwb_fpi_fallback)));
 	}
 
 	num_spaces = 0;
@@ -3796,8 +3836,10 @@ BufferSync(int flags)
 	 */
 	IssuePendingWritebacks(&wb_context, IOCONTEXT_NORMAL);
 
-	/* Clear the DWB checkpoint batch flag so future FlushBuffer calls
-	 * (from bgwriter or backend eviction) resume per-page DWB writes. */
+	/*
+	 * Clear the DWB checkpoint batch flag so future FlushBuffer calls
+	 * (from bgwriter or backend eviction) resume per-page DWB writes.
+	 */
 	if (DWBufIsEnabled())
 		DWBufSetCheckpointWritesDone(false);
 
@@ -4604,16 +4646,18 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	if (DWBufIsEnabled() && !DWBufCheckpointWritesDone())
 	{
 		int			dwb_file_idx;
+		uint64		dwb_write_gen;
 
 		dwb_file_idx = DWBufWritePage(BufTagGetRelFileLocator(&buf->tag),
 									  BufTagGetForkNum(&buf->tag),
 									  buf->tag.blockNum,
 									  bufToWrite,
-									  recptr);
+									  recptr,
+									  &dwb_write_gen);
 
 		if (dwb_file_idx >= 0)
 		{
-			DWBufFlushFile(dwb_file_idx);
+			DWBufFlushFile(dwb_file_idx, dwb_write_gen);
 		}
 		else
 		{
