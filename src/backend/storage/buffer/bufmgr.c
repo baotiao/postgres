@@ -3564,12 +3564,15 @@ BufferSync(int flags)
 
 		for (i = 0; i < num_to_scan; i++)
 		{
-			BufferDesc *bufHdr;
-			Block		bufBlock;
-			char	   *bufToWrite;
-			XLogRecPtr	page_lsn;
-			uint64		state;
-			int			dwb_rc;
+			BufferDesc	   *bufHdr;
+			Block			bufBlock;
+			char		   *bufToWrite;
+			RelFileLocator	buf_rlocator;
+			ForkNumber		buf_forknum;
+			BlockNumber		buf_blkno;
+			XLogRecPtr		page_lsn;
+			uint64			state;
+			int				dwb_rc;
 
 			buf_id = CkptBufferIds[i].buf_id;
 			bufHdr = GetBufferDescriptor(buf_id);
@@ -3601,6 +3604,16 @@ BufferSync(int flags)
 			PinBuffer_Locked(bufHdr);
 
 			/*
+			 * Capture tag fields while the buffer is pinned.  After
+			 * UnpinBuffer the descriptor could be evicted and its tag
+			 * overwritten; we need the original identity for the FPI
+			 * fallback path below.
+			 */
+			buf_rlocator = BufTagGetRelFileLocator(&bufHdr->tag);
+			buf_forknum  = BufTagGetForkNum(&bufHdr->tag);
+			buf_blkno    = bufHdr->tag.blockNum;
+
+			/*
 			 * Copy the page while holding the shared content lock.
 			 * PageSetChecksumCopy returns a pointer to a private copy, so
 			 * we can release the lock before doing the DWB I/O, reducing
@@ -3608,10 +3621,9 @@ BufferSync(int flags)
 			 */
 			LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_SHARE);
 
-			bufBlock = BufHdrGetBlock(bufHdr);
-			bufToWrite = PageSetChecksumCopy((Page) bufBlock,
-											 bufHdr->tag.blockNum);
-			page_lsn = PageGetLSN((Page) bufBlock);
+			bufBlock   = BufHdrGetBlock(bufHdr);
+			bufToWrite = PageSetChecksumCopy((Page) bufBlock, buf_blkno);
+			page_lsn   = PageGetLSN((Page) bufBlock);
 
 			LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_UNLOCK);
 
@@ -3620,12 +3632,8 @@ BufferSync(int flags)
 			 * NULL for write_gen_out since Phase 1 uses DWBufFlush() (which
 			 * fsyncs all files at once) rather than DWBufFlushFile().
 			 */
-			dwb_rc = DWBufWritePage(BufTagGetRelFileLocator(&bufHdr->tag),
-									BufTagGetForkNum(&bufHdr->tag),
-									bufHdr->tag.blockNum,
-									bufToWrite,
-									page_lsn,
-									NULL);
+			dwb_rc = DWBufWritePage(buf_rlocator, buf_forknum, buf_blkno,
+									bufToWrite, page_lsn, NULL);
 
 			UnpinBuffer(bufHdr);
 
@@ -3637,14 +3645,10 @@ BufferSync(int flags)
 				 * the data-file write is torn.  This mirrors the identical
 				 * fallback in FlushBuffer().
 				 */
-				RelFileLocator rlocator = BufTagGetRelFileLocator(&bufHdr->tag);
 				XLogRecPtr	fpi_lsn;
 
-				fpi_lsn = log_newpage(&rlocator,
-									  BufTagGetForkNum(&bufHdr->tag),
-									  bufHdr->tag.blockNum,
-									  (Page) bufToWrite,
-									  true);
+				fpi_lsn = log_newpage(&buf_rlocator, buf_forknum, buf_blkno,
+									  (Page) bufToWrite, true);
 				XLogFlush(fpi_lsn);
 				dwb_fpi_fallback++;
 			}
@@ -3667,9 +3671,15 @@ BufferSync(int flags)
 		 */
 		DWBufSetCheckpointWritesDone(true);
 
-		ereport(DEBUG1,
-				(errmsg("checkpoint DWB phase 1 complete: %d pages written to DWB, %d FPI fallbacks",
-						dwb_written, dwb_fpi_fallback)));
+		if (dwb_fpi_fallback > 0)
+			ereport(LOG,
+					(errmsg("checkpoint DWB phase 1: %d pages written to DWB, "
+							"%d overflow FPI fallbacks (DWB too small for workload)",
+							dwb_written, dwb_fpi_fallback)));
+		else
+			ereport(DEBUG1,
+					(errmsg("checkpoint DWB phase 1 complete: %d pages written to DWB",
+							dwb_written)));
 	}
 
 	num_spaces = 0;
