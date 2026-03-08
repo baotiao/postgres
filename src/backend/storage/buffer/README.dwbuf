@@ -1,0 +1,269 @@
+Double Write Buffer (DWB) Design and Implementation Notes
+==========================================================
+
+Background and Goals
+--------------------
+
+PostgreSQL's Full Page Writes (FPW) protect against torn pages: after a crash,
+if only part of an 8 kB data page reached disk, the full-page image recorded in
+WAL restores it.  The cost is WAL write amplification — every page's first
+modification after a checkpoint writes the entire 8 kB to WAL.
+
+The Double Write Buffer (DWB) is an alternative mechanism, analogous to
+InnoDB's doublewrite buffer.  Pages are written to a dedicated DWB file before
+being written to the real data files.  If a crash occurs during a data-file
+write, recovery reads the page from the DWB instead of relying on WAL FPW.
+
+This reduces WAL write amplification while preserving torn-page protection.
+
+
+GUC Control
+-----------
+
+  io_torn_pages_protection = off | full_pages | double_writes
+
+  off           — no protection (dangerous)
+  full_pages    — Full Page Writes to WAL (default PostgreSQL behaviour)
+  double_writes — DWB mode (this feature)
+
+  double_write_buffer_size = <MB>   (default 64 MB, range 16–1024 MB)
+
+DWB is not a complete replacement for FPW in all paths:
+  - When the DWB ring buffer is full the write falls back to a WAL FPI.
+  - During online backup (runningBackups > 0) FPW is used regardless.
+
+
+File Layout
+-----------
+
+  $PGDATA/pg_dwbuf/
+  ├── dwbuf_000    (segment 0, up to DWBUF_SLOTS_PER_FILE = 4096 slots)
+  ├── dwbuf_001    (segment 1)
+  ...
+  └── dwbuf_NNN    (up to DWBUF_MAX_FILES = 16 segment files)
+
+Total capacity: double_write_buffer_size, spread across segment files.
+
+Each file:
+
+  [ File header, padded to DWBUF_FILE_HEADER_SIZE (4096 B) ]
+  [ Slot 0: DWBufPageSlot header + 8 kB page data, aligned to PG_IO_ALIGN_SIZE ]
+  [ Slot 1 ]
+  ...
+  [ Slot N-1 ]
+
+DWBufPageSlot (on-disk slot header):
+
+  pg_crc32c      crc;       -- CRC over header (excl. crc field) + page data
+  RelFileLocator rlocator;  -- identifies the relation
+  ForkNumber     forknum;
+  BlockNumber    blkno;
+  XLogRecPtr     lsn;       -- page LSN at write time
+  uint32         slot_id;   -- monotonically increasing global slot number
+  uint16         flags;     -- DWBUF_SLOT_VALID = 0x0001
+  uint16         checksum;  -- page checksum
+
+DWBufFileHeader (first DWBUF_FILE_HEADER_SIZE bytes of each file):
+
+  uint32    magic;           -- 0x44574246 ("DWBF")
+  uint32    version;         -- DWBUF_VERSION = 1
+  uint32    blcksz;          -- must match BLCKSZ
+  uint32    slots_per_file;
+  pg_crc32c crc;             -- CRC over preceding fields
+
+
+Shared Memory Control Structure (DWBufCtlData)
+----------------------------------------------
+
+All atomics; no LWLock required for the normal write path.
+
+  write_pos            -- next slot number to allocate (monotonically increasing)
+  flush_pos            -- write_pos value at last DWBufFlush()
+  active_writers       -- count of writers between fetch_add(write_pos) and
+                           completion of pg_pwrite()
+  resetting            -- quiesce flag; 1 while PreCheckpoint or PostCheckpoint
+                           is draining active writers (see below)
+  checkpoint_start_pos -- write_pos snapshot taken by DWBufPreCheckpoint after
+                           quiescing; used to detect ring-buffer wrap-around
+  file_write_gen[]     -- per-file: incremented by each DWBufWritePage
+  file_sync_gen[]      -- per-file: updated to file_write_gen after each fsync
+  file_syncing[]       -- per-file CAS lock: 1 while an fsync is in progress
+  overflow_count       -- cumulative count of ring-buffer overflow FPI fallbacks
+  num_slots            -- total ring-buffer capacity
+  num_files            -- number of segment files
+  slots_per_file
+
+
+Normal Write Path (DWBufWritePage)
+-----------------------------------
+
+1. Ensure files are open in this process (PID-tracked, re-opened after fork).
+
+2. Quiesce coordination:
+     loop:
+       spin-wait while resetting == 1   [CHECK_FOR_INTERRUPTS() on each iter]
+       atomic_fetch_add(active_writers, 1)
+       if resetting still 0: break      -- successfully registered
+       atomic_fetch_sub(active_writers, 1)  -- lost race, retry
+
+3. Allocate slot: pos = atomic_fetch_add(write_pos, 1)
+
+4. Ring-buffer overflow check:
+     ckpt_start = checkpoint_start_pos
+     if pos - ckpt_start >= num_slots:
+         atomic_fetch_sub(active_writers, 1)
+         atomic_fetch_add(overflow_count, 1)
+         emit DEBUG2 log
+         return -1   -- caller falls back to FPI
+
+5. Compute physical location:
+     slot_pos = pos % num_slots
+     file_idx = slot_pos / slots_per_file
+     slot_idx = slot_pos % slots_per_file
+     offset   = DWBUF_FILE_HEADER_SIZE + slot_idx * DWBUF_SLOT_SIZE
+
+6. Build slot header in process-local buffer; compute CRC32C over header
+   (excluding crc field) + page data; write CRC into header.
+
+7. pg_pwrite() DWBUF_SLOT_SIZE bytes to DWB file; track IO via pgstat.
+
+8. atomic_fetch_add(file_write_gen[file_idx], 1)  -- record write generation
+   Return write_gen to caller via out-parameter.
+
+9. atomic_fetch_sub(active_writers, 1)
+
+10. Return file_idx.
+
+
+Batch fsync Optimisation (DWBufFlushFile)
+------------------------------------------
+
+Non-checkpoint callers (FlushBuffer in bufmgr.c) call DWBufFlushFile(file_idx,
+write_gen) after DWBufWritePage returns.  The optimisation:
+
+  fast path: if file_sync_gen[file_idx] >= write_gen → return (no syscall)
+
+  slow path:
+    CAS file_syncing[file_idx]: 0 → 1
+      success: re-check sync_gen (another syncer may have just finished);
+               pg_fsync(); advance file_sync_gen to current file_write_gen;
+               clear file_syncing.
+      failure: spin-wait for file_syncing == 0  [CHECK_FOR_INTERRUPTS() on
+               each iteration]; re-check sync_gen; if still insufficient retry.
+
+A single fsync can satisfy many concurrent writers targeting the same file.
+
+
+Checkpoint Integration
+-----------------------
+
+DWBufPreCheckpoint() — called at the start of CheckpointGuts():
+
+  The function must guarantee that DWBufFlush() covers every slot allocated
+  before this point.  A naive snapshot-then-fsync has a race: a writer may
+  have incremented write_pos but not yet issued pg_pwrite() when we take the
+  snapshot; the subsequent fsync would miss that slot.
+
+  Fix: reuse the resetting flag to quiesce all writers first.
+
+    1. resetting = 1  (blocks new writers)
+    2. spin-wait active_writers == 0  (all in-flight pwrite()s complete)
+    3. DWBufFlush()  (fsync covers every allocated slot)
+    4. checkpoint_start_pos = write_pos  (ring-buffer boundary for new cycle)
+    5. resetting = 0  (writers resume)
+
+  Note: CHECK_FOR_INTERRUPTS is intentionally absent from step 2 because we
+  hold resetting == 1.  An error exit would leave resetting permanently set,
+  blocking all future DWB writes.  Step 2 is bounded by pwrite latency only
+  and completes quickly.
+
+DWBufPostCheckpoint() — called after CheckpointGuts() completes:
+
+  1. resetting = 1
+  2. spin-wait active_writers == 0
+  3. write_pos = 0; flush_pos = 0; checkpoint_start_pos = 0
+  4. resetting = 0
+
+  Resetting checkpoint_start_pos to 0 is essential: without it, the next
+  DWBufWritePage would compute (pos - old_checkpoint_start_pos) with uint64
+  underflow and every write would overflow until the next PreCheckpoint.
+
+BufferSync() Phase 1 (batch DWB write during checkpoint):
+
+  Before Phase 2 (the normal dirty-page flush loop), the checkpointer iterates
+  all checkpoint-needed buffers and writes them to DWB in bulk, then calls
+  DWBufFlush() once.  This replaces the per-page DWBufWritePage + DWBufFlushFile
+  that FlushBuffer would otherwise do, collapsing N fsyncs into one per segment
+  file.
+
+  For pages that return -1 from DWBufWritePage (ring buffer full), Phase 1
+  falls back to log_newpage() + XLogFlush() — the standard WAL FPI path.
+  The per-file fallback count is logged at LOG level when > 0.
+
+  After Phase 1 sets DWBufCheckpointWritesDone(true), FlushBuffer skips its
+  own DWBufWritePage call for checkpoint-needed pages.  The flag is cleared
+  after BufferSync() finishes.
+
+
+Crash Recovery (DWBufRecoveryInit / DWBufRecoverPage)
+------------------------------------------------------
+
+Called from StartupXLOG() before WAL replay begins.
+
+DWBufRecoveryInit():
+  1. Create in-memory hash table keyed by (rlocator, forknum, blkno).
+  2. Scan all pg_dwbuf/dwbuf_NNN files:
+       a. Validate file header magic + CRC; skip on mismatch.
+       b. For each slot: check DWBUF_SLOT_VALID flag; verify CRC.
+       c. Insert valid slot into hash table.  If a later slot has a higher
+          LSN (or equal LSN but higher slot_id), it replaces the earlier one.
+       d. Page data is copied into TopMemoryContext so recovery does not
+          need to re-read DWB files (which may be overwritten during replay).
+
+DWBufRecoverPage(rlocator, forknum, blkno, page_buf):
+  Look up the hash table.  If found and page_data != NULL, memcpy and return
+  true.  Called by buffer_readv_complete_one() when PageIsVerified() fails.
+
+
+Fork Safety
+-----------
+
+File descriptors are per-process and must not be inherited across fork().
+
+  DWBufFds[DWBUF_MAX_FILES]  — per-process FDs, initialised to -1
+  DWBufFilesOpenedPid         — PID that opened the FDs
+
+DWBufOpenFiles() checks getpid() == DWBufFilesOpenedPid.  If the PID differs
+(child process after fork), it calls DWBufClose() to close inherited FDs before
+reopening.  This prevents EBADF or silent cross-process sharing.
+
+
+IO Statistics
+-------------
+
+DWB IO is tracked through the pgstat_io framework:
+
+  IOOBJECT_DWBUF + IOCONTEXT_NORMAL
+  IOOP_WRITE  — each DWBufWritePage pwrite()
+  IOOP_FSYNC  — each pg_fsync() in DWBufFlush() or DWBufFlushFile()
+
+
+Known Limitations and Future Work
+----------------------------------
+
+Memory usage during recovery:
+  Page data is stored in TopMemoryContext (one BLCKSZ copy per valid slot).
+  With double_write_buffer_size = 1024 MB this can reach ~1 GB.  A future
+  improvement is streaming recovery: store only slot metadata and re-read
+  pages on demand.
+
+Version migration:
+  DWBufFileHeader.version = 1.  There is currently no upgrade path for future
+  format changes, and pg_upgrade does not clear pg_dwbuf.  A future version
+  should add a min_version field and clear pg_dwbuf on version mismatch,
+  following the pg_wal precedent.
+
+Overflow monitoring:
+  DWBufCtl->overflow_count records cumulative ring-buffer overflows.  A non-zero
+  and growing value indicates double_write_buffer_size is too small.  Future work
+  could expose this counter through pg_stat_io or a dedicated view.

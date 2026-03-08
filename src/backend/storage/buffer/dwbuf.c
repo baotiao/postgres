@@ -184,6 +184,9 @@ DWBufShmemInit(void)
 			pg_atomic_init_u32(&DWBufCtl->file_syncing[f], 0);
 		}
 
+		/* Initialize overflow counter */
+		pg_atomic_init_u64(&DWBufCtl->overflow_count, 0);
+
 	}
 }
 
@@ -387,14 +390,23 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	DWBufOpenFiles();
 
 	/*
-	 * Coordinate with DWBufPostCheckpoint() reset. Writers that race with reset
-	 * must either fully complete before reset proceeds, or wait until reset is
-	 * finished.
+	 * Coordinate with DWBufPreCheckpoint() and DWBufPostCheckpoint() which
+	 * set resetting=1 to quiesce writers.  Writers that race with a quiesce
+	 * must either fully complete before the quiesce proceeds, or wait until
+	 * it is finished.
+	 *
+	 * CHECK_FOR_INTERRUPTS() is safe here: active_writers has not yet been
+	 * incremented, so an error exit requires no cleanup of shared state.
+	 * This also prevents infinite blocking if the checkpointer crashes with
+	 * resetting=1 set; a SIGTERM will still let the backend exit cleanly.
 	 */
 	for (;;)
 	{
 		while (pg_atomic_read_u32(&DWBufCtl->resetting) != 0)
+		{
+			CHECK_FOR_INTERRUPTS();
 			pg_usleep(100);
+		}
 
 		pg_atomic_fetch_add_u32(&DWBufCtl->active_writers, 1);
 
@@ -413,6 +425,10 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	 * and this slot's previous occupant may not have had its data file
 	 * page fsynced yet (the checkpoint that would have fsynced it hasn't
 	 * completed).  Fall back to FPW for this page.
+	 *
+	 * Each overflow is counted in DWBufCtl->overflow_count so that
+	 * administrators can detect chronic DWB undersizing via monitoring.
+	 * Frequent overflows mean double_write_buffer_size should be increased.
 	 */
 	{
 		uint64		ckpt_start =
@@ -420,7 +436,16 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 
 		if (pos - ckpt_start >= (uint64) DWBufCtl->num_slots)
 		{
+			uint64		overflow_total;
+
 			pg_atomic_fetch_sub_u32(&DWBufCtl->active_writers, 1);
+
+			overflow_total =
+				pg_atomic_fetch_add_u64(&DWBufCtl->overflow_count, 1) + 1;
+			ereport(DEBUG2,
+					(errmsg("double write buffer ring full: FPI fallback "
+							"(total overflows: " UINT64_FORMAT ")",
+							overflow_total)));
 			return -1;
 		}
 	}
@@ -615,9 +640,16 @@ DWBufFlushFile(int file_idx, uint64 write_gen)
 			return;
 		}
 
-		/* Another process is fsyncing — wait for it to finish */
+		/*
+		 * Another process is fsyncing — wait for it to finish.
+		 * CHECK_FOR_INTERRUPTS() allows SIGTERM to interrupt an arbitrarily
+		 * long wait; no shared state was modified so no cleanup is needed.
+		 */
 		while (pg_atomic_read_u32(&DWBufCtl->file_syncing[file_idx]) != 0)
+		{
+			CHECK_FOR_INTERRUPTS();
 			pg_usleep(10);
+		}
 
 		/* Recheck: the completed fsync may cover our write */
 		if (pg_atomic_read_u64(&DWBufCtl->file_sync_gen[file_idx]) >= my_gen)
@@ -629,6 +661,19 @@ DWBufFlushFile(int file_idx, uint64 write_gen)
 
 /*
  * Called before checkpoint to ensure DWB is in consistent state.
+ *
+ * We must guarantee that DWBufFlush() covers every slot allocated before
+ * this point.  A naive approach — read write_pos, then fsync — has a
+ * race: a writer might have incremented write_pos but not yet issued its
+ * pg_pwrite() when we take the snapshot.  The resulting fsync would skip
+ * that slot, leaving it potentially absent from the DWB when the
+ * checkpoint relies on it for torn-page protection.
+ *
+ * The fix is to reuse the resetting flag (also used by DWBufPostCheckpoint)
+ * to block new writers, then drain in-flight writers before flushing.
+ * Once active_writers reaches zero, every slot with pos < write_pos is
+ * guaranteed to have a completed pwrite, so a single DWBufFlush() covers
+ * the entire allocated range.
  */
 void
 DWBufPreCheckpoint(void)
@@ -636,26 +681,52 @@ DWBufPreCheckpoint(void)
 	if (!DWBufIsEnabled())
 		return;
 
-	/* Flush all pending writes */
+	/*
+	 * Block new writers.  Writers that race with this will spin until
+	 * we clear resetting below.  We do not add CHECK_FOR_INTERRUPTS in
+	 * the drain loop below because we hold resetting == 1; if we exit via
+	 * an error, resetting would remain 1 permanently and block all future
+	 * DWB writes.  The drain window is bounded by the pwrite latency of
+	 * currently-active writers and is short in practice.
+	 */
+	pg_atomic_write_u32(&DWBufCtl->resetting, 1);
+
+	/* Drain all in-flight writers so every allocated slot has its pwrite. */
+	while (pg_atomic_read_u32(&DWBufCtl->active_writers) != 0)
+		pg_usleep(100);
+
+	/*
+	 * Now safe to flush: no writer holds a slot between pg_pwrite() and
+	 * active_writers decrement.  DWBufFlush() will fsync all data written
+	 * up to the current write_pos.
+	 */
 	DWBufFlush();
 
 	/*
-	 * Record the current write_pos as the checkpoint start position.
-	 * DWBufWritePage uses this to detect when a slot reuse would overlap
-	 * with data not yet protected by a completed checkpoint, and falls
-	 * back to FPW for those pages.
+	 * Record checkpoint_start_pos.  Slots at positions >= this value
+	 * belong to the next checkpoint cycle; DWBufWritePage uses this to
+	 * detect ring-buffer wrap-around and fall back to FPI when needed.
 	 */
 	pg_atomic_write_u64(&DWBufCtl->checkpoint_start_pos,
 						pg_atomic_read_u64(&DWBufCtl->write_pos));
+
+	/* Allow writers to proceed again. */
+	pg_atomic_write_u32(&DWBufCtl->resetting, 0);
 }
 
 /*
  * Called after checkpoint to reset DWB for next cycle.
  *
- * Blocks new writers, waits for in-flight writers to drain, resets the
+ * Blocks new writers (via resetting=1, the same flag used by
+ * DWBufPreCheckpoint), waits for in-flight writers to drain, resets the
  * ring buffer positions, then unblocks.  No file I/O is needed — the
  * on-disk slot data is only consulted during crash recovery, and the
  * CRC-based validation in DWBufRecoveryInit() handles stale slots.
+ *
+ * We do not add CHECK_FOR_INTERRUPTS in the drain loop below because we
+ * hold resetting == 1; an error exit would leave resetting permanently set,
+ * blocking all future DWB writes.  The drain is bounded by the pwrite
+ * latency of active writers and completes quickly in practice.
  */
 void
 DWBufPostCheckpoint(void)
@@ -896,6 +967,22 @@ bool
 DWBufIsEnabled(void)
 {
 	return double_write_buffer && DWBufCtl != NULL;
+}
+
+/*
+ * Return the cumulative count of DWB ring-buffer overflows since startup.
+ *
+ * Each overflow represents a page that fell back to a WAL full-page image
+ * because the ring buffer was full.  A non-zero and growing value indicates
+ * that double_write_buffer_size is too small for the current workload.
+ */
+uint64
+DWBufGetOverflowCount(void)
+{
+	if (!DWBufIsEnabled())
+		return 0;
+
+	return pg_atomic_read_u64(&DWBufCtl->overflow_count);
 }
 
 /*
