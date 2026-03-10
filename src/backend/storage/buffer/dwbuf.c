@@ -184,9 +184,6 @@ DWBufShmemInit(void)
 			pg_atomic_init_u32(&DWBufCtl->file_syncing[f], 0);
 		}
 
-		/* Initialize overflow counter */
-		pg_atomic_init_u64(&DWBufCtl->overflow_count, 0);
-
 	}
 }
 
@@ -416,37 +413,53 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 		pg_atomic_fetch_sub_u32(&DWBufCtl->active_writers, 1);
 	}
 
-	/* Get next slot position atomically */
-	pos = pg_atomic_fetch_add_u64(&DWBufCtl->write_pos, 1);
-
 	/*
-	 * Check slot reuse safety.  If write_pos has advanced more than
-	 * num_slots past checkpoint_start_pos, the ring buffer has wrapped
-	 * and this slot's previous occupant may not have had its data file
-	 * page fsynced yet (the checkpoint that would have fsynced it hasn't
-	 * completed).  Fall back to FPW for this page.
-	 *
-	 * Each overflow is counted in DWBufCtl->overflow_count so that
-	 * administrators can detect chronic DWB undersizing via monitoring.
-	 * Frequent overflows mean double_write_buffer_size should be increased.
+	 * Allocate a slot and check ring-buffer space.  If the ring buffer is
+	 * full (write_pos has advanced num_slots past checkpoint_start_pos),
+	 * the slot's previous occupant may not have been fsynced yet.  In that
+	 * case we release our active_writers count, sleep, and retry from the
+	 * top (re-checking the resetting flag).  This blocks until a checkpoint
+	 * completes and advances checkpoint_start_pos, similar to InnoDB's
+	 * doublewrite behavior.
 	 */
+	for (;;)
 	{
-		uint64		ckpt_start =
-			pg_atomic_read_u64(&DWBufCtl->checkpoint_start_pos);
+		uint64		ckpt_start;
 
-		if (pos - ckpt_start >= (uint64) DWBufCtl->num_slots)
+		pos = pg_atomic_fetch_add_u64(&DWBufCtl->write_pos, 1);
+
+		ckpt_start = pg_atomic_read_u64(&DWBufCtl->checkpoint_start_pos);
+
+		if (pos - ckpt_start < (uint64) DWBufCtl->num_slots)
+			break;				/* slot is safe to use */
+
+		/* Ring buffer full — give back writer count and wait */
+		pg_atomic_fetch_sub_u32(&DWBufCtl->active_writers, 1);
+
+		ereport(DEBUG2,
+				(errmsg("double write buffer ring full, waiting for checkpoint")));
+
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000);		/* 1 ms */
+
+		/*
+		 * Re-enter the writer registration loop at the top of the
+		 * function, which handles the resetting flag properly.
+		 */
+		for (;;)
 		{
-			uint64		overflow_total;
+			while (pg_atomic_read_u32(&DWBufCtl->resetting) != 0)
+			{
+				CHECK_FOR_INTERRUPTS();
+				pg_usleep(100);
+			}
+
+			pg_atomic_fetch_add_u32(&DWBufCtl->active_writers, 1);
+
+			if (pg_atomic_read_u32(&DWBufCtl->resetting) == 0)
+				break;
 
 			pg_atomic_fetch_sub_u32(&DWBufCtl->active_writers, 1);
-
-			overflow_total =
-				pg_atomic_fetch_add_u64(&DWBufCtl->overflow_count, 1) + 1;
-			ereport(DEBUG2,
-					(errmsg("double write buffer ring full: FPI fallback "
-							"(total overflows: " UINT64_FORMAT ")",
-							overflow_total)));
-			return -1;
 		}
 	}
 
@@ -969,21 +982,6 @@ DWBufIsEnabled(void)
 	return double_write_buffer && DWBufCtl != NULL;
 }
 
-/*
- * Return the cumulative count of DWB ring-buffer overflows since startup.
- *
- * Each overflow represents a page that fell back to a WAL full-page image
- * because the ring buffer was full.  A non-zero and growing value indicates
- * that double_write_buffer_size is too small for the current workload.
- */
-uint64
-DWBufGetOverflowCount(void)
-{
-	if (!DWBufIsEnabled())
-		return 0;
-
-	return pg_atomic_read_u64(&DWBufCtl->overflow_count);
-}
 
 /*
  * Process-local flag: when true, FlushBuffer skips per-page DWB writes

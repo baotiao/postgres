@@ -113,9 +113,9 @@ typedef struct DWBufCtlData
 	 * Slot reuse safety.  Records the write_pos at the start of each
 	 * checkpoint (set by DWBufPreCheckpoint after quiescing writers and
 	 * flushing).  When write_pos has advanced num_slots past this value,
-	 * the ring buffer has wrapped; DWBufWritePage returns -1 so the caller
-	 * falls back to a full page image in WAL rather than overwrite an
-	 * as-yet-unflushed DWB slot.
+	 * the ring buffer has wrapped; DWBufWritePage blocks until a
+	 * checkpoint completes and advances this value, rather than overwrite
+	 * an as-yet-unflushed DWB slot.
 	 */
 	pg_atomic_uint64	checkpoint_start_pos;
 
@@ -131,16 +131,6 @@ typedef struct DWBufCtlData
 	pg_atomic_uint64	file_write_gen[DWBUF_MAX_FILES];
 	pg_atomic_uint64	file_sync_gen[DWBUF_MAX_FILES];
 	pg_atomic_uint32	file_syncing[DWBUF_MAX_FILES];
-
-	/*
-	 * Ring-buffer overflow counter.
-	 *
-	 * Incremented each time DWBufWritePage falls back to FPI because the
-	 * DWB ring buffer is full (pos - checkpoint_start_pos >= num_slots).
-	 * Persistent across checkpoint cycles; readers can snapshot and diff.
-	 * Frequent overflows indicate double_write_buffer_size is too small.
-	 */
-	pg_atomic_uint64	overflow_count;
 
 	/* Configuration (set at startup) */
 	int				num_slots;		/* Total number of slots */
@@ -207,6 +197,5 @@ extern void DWBufRecoveryFinish(void);
 
 /* Utility functions */
 extern bool DWBufIsEnabled(void);
-extern uint64 DWBufGetOverflowCount(void);
 
 #endif							/* DWBUF_H */

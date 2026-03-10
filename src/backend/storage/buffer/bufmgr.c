@@ -3553,6 +3553,9 @@ BufferSync(int flags)
 	 * FlushBuffer, dramatically reducing fsync overhead for the checkpointer
 	 * (from one fsync per dirty page down to one fsync per DWB file).
 	 *
+	 * DWBufWritePage blocks if the ring buffer is full, waiting for a
+	 * checkpoint to complete and free space.
+	 *
 	 * After the batch DWB write, we set a process-local flag so that
 	 * FlushBuffer skips the per-page DWB write during Phase 2 (the normal
 	 * data-file write loop below).
@@ -3560,7 +3563,6 @@ BufferSync(int flags)
 	if (DWBufIsEnabled())
 	{
 		int		dwb_written = 0;
-		int		dwb_fpi_fallback = 0;
 
 		for (i = 0; i < num_to_scan; i++)
 		{
@@ -3572,7 +3574,6 @@ BufferSync(int flags)
 			BlockNumber		buf_blkno;
 			XLogRecPtr		page_lsn;
 			uint64			state;
-			int				dwb_rc;
 
 			buf_id = CkptBufferIds[i].buf_id;
 			bufHdr = GetBufferDescriptor(buf_id);
@@ -3606,8 +3607,7 @@ BufferSync(int flags)
 			/*
 			 * Capture tag fields while the buffer is pinned.  After
 			 * UnpinBuffer the descriptor could be evicted and its tag
-			 * overwritten; we need the original identity for the FPI
-			 * fallback path below.
+			 * overwritten.
 			 */
 			buf_rlocator = BufTagGetRelFileLocator(&bufHdr->tag);
 			buf_forknum  = BufTagGetForkNum(&bufHdr->tag);
@@ -3632,28 +3632,12 @@ BufferSync(int flags)
 			 * NULL for write_gen_out since Phase 1 uses DWBufFlush() (which
 			 * fsyncs all files at once) rather than DWBufFlushFile().
 			 */
-			dwb_rc = DWBufWritePage(buf_rlocator, buf_forknum, buf_blkno,
-									bufToWrite, page_lsn, NULL);
+			DWBufWritePage(buf_rlocator, buf_forknum, buf_blkno,
+						   bufToWrite, page_lsn, NULL);
 
 			UnpinBuffer(bufHdr);
 
-			if (dwb_rc < 0)
-			{
-				/*
-				 * DWB ring buffer is full — fall back to a full page image
-				 * in WAL so crash recovery can restore this page even if
-				 * the data-file write is torn.  This mirrors the identical
-				 * fallback in FlushBuffer().
-				 */
-				XLogRecPtr	fpi_lsn;
-
-				fpi_lsn = log_newpage(&buf_rlocator, buf_forknum, buf_blkno,
-									  (Page) bufToWrite, true);
-				XLogFlush(fpi_lsn);
-				dwb_fpi_fallback++;
-			}
-			else
-				dwb_written++;
+			dwb_written++;
 
 			/* Check for barrier events */
 			if (ProcSignalBarrierPending)
@@ -3666,20 +3650,13 @@ BufferSync(int flags)
 
 		/*
 		 * Tell FlushBuffer to skip per-page DWB writes in Phase 2.  Every
-		 * checkpoint-needed page is now protected by either the DWB batch
-		 * write above or a WAL full page image (FPI fallback for overflow).
+		 * checkpoint-needed page is now protected by the DWB batch write.
 		 */
 		DWBufSetCheckpointWritesDone(true);
 
-		if (dwb_fpi_fallback > 0)
-			ereport(LOG,
-					(errmsg("checkpoint DWB phase 1: %d pages written to DWB, "
-							"%d overflow FPI fallbacks (DWB too small for workload)",
-							dwb_written, dwb_fpi_fallback)));
-		else
-			ereport(DEBUG1,
-					(errmsg("checkpoint DWB phase 1 complete: %d pages written to DWB",
-							dwb_written)));
+		ereport(DEBUG1,
+				(errmsg("checkpoint DWB phase 1 complete: %d pages written to DWB",
+						dwb_written)));
 	}
 
 	num_spaces = 0;
@@ -4665,28 +4642,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 									  recptr,
 									  &dwb_write_gen);
 
-		if (dwb_file_idx >= 0)
-		{
-			DWBufFlushFile(dwb_file_idx, dwb_write_gen);
-		}
-		else
-		{
-			/*
-			 * DWB ring buffer is full — this slot would overwrite data not
-			 * yet protected by a completed checkpoint.  Fall back to writing
-			 * a full page image (FPI) to WAL so crash recovery can restore
-			 * this page even if the data file write is torn.
-			 */
-			XLogRecPtr	fpi_lsn;
-			RelFileLocator rlocator = BufTagGetRelFileLocator(&buf->tag);
-
-			fpi_lsn = log_newpage(&rlocator,
-								  BufTagGetForkNum(&buf->tag),
-								  buf->tag.blockNum,
-								  (Page) bufToWrite,
-								  true);
-			XLogFlush(fpi_lsn);
-		}
+		DWBufFlushFile(dwb_file_idx, dwb_write_gen);
 	}
 
 	/*
