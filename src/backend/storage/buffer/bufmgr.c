@@ -4642,7 +4642,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 									  recptr,
 									  &dwb_write_gen);
 
-		DWBufFlushFile(dwb_file_idx, dwb_write_gen);
+		DWBufBatchSync(dwb_file_idx, dwb_write_gen);
 	}
 
 	/*

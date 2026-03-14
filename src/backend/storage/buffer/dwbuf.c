@@ -184,6 +184,11 @@ DWBufShmemInit(void)
 			pg_atomic_init_u32(&DWBufCtl->file_syncing[f], 0);
 		}
 
+		/* Initialize batch sync coordination */
+		pg_atomic_init_u32(&DWBufCtl->batch_pending, 0);
+		pg_atomic_init_u64(&DWBufCtl->batch_complete_count, 0);
+		ConditionVariableInit(&DWBufCtl->batch_sync_cv);
+
 	}
 }
 
@@ -480,6 +485,11 @@ DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 	slot->forknum = forknum;
 	slot->blkno = blkno;
 	slot->lsn = lsn;
+	/*
+	 * Truncation to uint32 is safe: DWBufPostCheckpoint resets write_pos
+	 * to 0 each cycle, and the ring-buffer overflow check limits pos to
+	 * at most 2 * num_slots (~131 K at max config) per cycle.
+	 */
 	slot->slot_id = (uint32) pos;
 	slot->flags = DWBUF_SLOT_VALID;
 	slot->checksum = 0;			/* Will be set by PageSetChecksumCopy */
@@ -673,6 +683,120 @@ DWBufFlushFile(int file_idx, uint64 write_gen)
 }
 
 /*
+ * Leader helper: perform the actual batch fsync for non-checkpoint writers.
+ *
+ * Fsyncs all dirty DWB files (the per-file generation mechanism
+ * automatically skips clean files), advances the batch completion
+ * counter, resets the pending counter, and wakes all waiters.
+ *
+ * The ordering is important: batch_complete_count is advanced *before*
+ * batch_pending is reset.  This ensures that a new writer arriving
+ * between the advance and the reset reads the updated batch_complete_count
+ * and waits for a *subsequent* batch rather than falsely believing it was
+ * covered by this one.  See DWBufBatchSync header comment for details.
+ */
+static void
+dwbuf_batch_do_sync(void)
+{
+	/* Fsync all DWB files that have new writes since last sync */
+	for (int f = 0; f < DWBufCtl->num_files; f++)
+	{
+		uint64		wgen = pg_atomic_read_u64(&DWBufCtl->file_write_gen[f]);
+
+		if (wgen > pg_atomic_read_u64(&DWBufCtl->file_sync_gen[f]))
+			DWBufFlushFile(f, wgen);
+	}
+
+	/*
+	 * Advance completion counter first, then reset pending count.
+	 * See function header comment for ordering rationale.
+	 */
+	pg_atomic_fetch_add_u64(&DWBufCtl->batch_complete_count, 1);
+	pg_atomic_write_u32(&DWBufCtl->batch_pending, 0);
+	ConditionVariableBroadcast(&DWBufCtl->batch_sync_cv);
+}
+
+/*
+ * Batch-sync the DWB for non-checkpoint writers.
+ *
+ * Instead of calling DWBufFlushFile per page, writers register themselves
+ * in a batch.  When the batch reaches DWBUF_BATCH_SYNC_THRESHOLD pages
+ * the writer that crosses the threshold becomes the leader and fsyncs all
+ * dirty DWB files.  Other writers wait on a ConditionVariable; if no
+ * leader appears within DWBUF_BATCH_SYNC_TIMEOUT_MS the waiter promotes
+ * itself and triggers the fsync.
+ *
+ * Correctness guarantee: after returning, the caller's DWB page is
+ * durable.  The leader's fsync covers all file_write_gen values visible
+ * at scan time, but a narrow race exists: a writer whose DWBufWritePage
+ * incremented file_write_gen *after* the leader scanned that file may
+ * join the batch and wake up believing it was covered.  To close this
+ * window, every writer verifies its own file_sync_gen >= write_gen
+ * after waking and falls back to DWBufFlushFile if the batch missed it.
+ * The fallback fast-path is a single atomic read (no syscall) when the
+ * batch did cover the write, so the overhead is negligible.
+ */
+void
+DWBufBatchSync(int file_idx, uint64 write_gen)
+{
+	uint32		count;
+	uint64		my_batch_id;
+
+	/* DWBufWritePage returns -1 when DWB is disabled or ring buffer full */
+	if (file_idx < 0)
+		return;
+
+	count = pg_atomic_fetch_add_u32(&DWBufCtl->batch_pending, 1) + 1;
+	my_batch_id = pg_atomic_read_u64(&DWBufCtl->batch_complete_count);
+
+	if (count >= DWBUF_BATCH_SYNC_THRESHOLD)
+	{
+		/* Threshold reached — become the leader and fsync */
+		dwbuf_batch_do_sync();
+
+		/*
+		 * The leader's own write is guaranteed covered (program order:
+		 * file_write_gen was incremented before we entered this function,
+		 * and we read it in dwbuf_batch_do_sync on the same thread).
+		 * No fallback verification needed.
+		 */
+		return;
+	}
+
+	/* Wait for a leader to complete our batch, or timeout */
+	ConditionVariablePrepareToSleep(&DWBufCtl->batch_sync_cv);
+	for (;;)
+	{
+		if (pg_atomic_read_u64(&DWBufCtl->batch_complete_count) > my_batch_id)
+			break;				/* our batch has been synced */
+
+		if (ConditionVariableTimedSleep(&DWBufCtl->batch_sync_cv,
+										DWBUF_BATCH_SYNC_TIMEOUT_MS,
+										WAIT_EVENT_DWBUF_BATCH_SYNC))
+		{
+			/* Timeout — promote ourselves to leader */
+			ConditionVariableCancelSleep();
+			dwbuf_batch_do_sync();
+
+			/* Same as leader path: our own write is covered. */
+			return;
+		}
+	}
+	ConditionVariableCancelSleep();
+
+	/*
+	 * We were woken by a leader's broadcast.  The batch fsync *probably*
+	 * covered our write, but a race exists: if our DWBufWritePage
+	 * incremented file_write_gen after the leader scanned our file, the
+	 * fsync may have missed us.  Verify and fall back if needed.
+	 *
+	 * Fast path (common case): file_sync_gen already >= our write_gen,
+	 * so DWBufFlushFile returns immediately with no syscall.
+	 */
+	DWBufFlushFile(file_idx, write_gen);
+}
+
+/*
  * Called before checkpoint to ensure DWB is in consistent state.
  *
  * We must guarantee that DWBufFlush() covers every slot allocated before
@@ -714,6 +838,17 @@ DWBufPreCheckpoint(void)
 	 * up to the current write_pos.
 	 */
 	DWBufFlush();
+
+	/*
+	 * Wake any writers sleeping in DWBufBatchSync.  With resetting == 1
+	 * no new writers can enter DWBufWritePage, so the batch threshold may
+	 * never be reached and waiters would stall for the full 10 ms timeout.
+	 * DWBufFlush() above already fsynced everything, so the woken writers
+	 * will find file_sync_gen >= their write_gen and return immediately
+	 * from the DWBufFlushFile fallback.
+	 */
+	pg_atomic_fetch_add_u64(&DWBufCtl->batch_complete_count, 1);
+	ConditionVariableBroadcast(&DWBufCtl->batch_sync_cv);
 
 	/*
 	 * Record checkpoint_start_pos.  Slots at positions >= this value
@@ -763,6 +898,13 @@ DWBufPostCheckpoint(void)
 	 * triggering the overflow guard and returning -1 for all DWB writes.
 	 */
 	pg_atomic_write_u64(&DWBufCtl->checkpoint_start_pos, 0);
+
+	/*
+	 * Reset batch_pending so stale increments from writers that ran
+	 * during the checkpoint don't carry over and trigger a premature
+	 * batch sync on the first few writes of the new cycle.
+	 */
+	pg_atomic_write_u32(&DWBufCtl->batch_pending, 0);
 
 	pg_atomic_write_u32(&DWBufCtl->resetting, 0);
 }

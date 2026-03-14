@@ -20,6 +20,7 @@
 
 #include "storage/block.h"
 #include "storage/buf.h"
+#include "storage/condition_variable.h"
 #include "storage/relfilelocator.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -132,11 +133,20 @@ typedef struct DWBufCtlData
 	pg_atomic_uint64	file_sync_gen[DWBUF_MAX_FILES];
 	pg_atomic_uint32	file_syncing[DWBUF_MAX_FILES];
 
+	/* Batch sync coordination for non-checkpoint writers */
+	pg_atomic_uint32	batch_pending;		/* current batch un-synced page count */
+	pg_atomic_uint64	batch_complete_count; /* monotonically increasing, +1 per batch sync */
+	ConditionVariable	batch_sync_cv;		/* broadcast when batch sync completes */
+
 	/* Configuration (set at startup) */
 	int				num_slots;		/* Total number of slots */
 	int				num_files;		/* Number of segment files */
 	int				slots_per_file;	/* Slots per segment file */
 } DWBufCtlData;
+
+/* Batch sync thresholds for non-checkpoint writers */
+#define DWBUF_BATCH_SYNC_THRESHOLD	256		/* pages per batch (~2 MB) */
+#define DWBUF_BATCH_SYNC_TIMEOUT_MS	10		/* low-load timeout in ms */
 
 /* Default and limits for double_write_buffer_size (in MB) */
 #define DWBUF_DEFAULT_SIZE_MB	64
@@ -179,6 +189,7 @@ extern int DWBufWritePage(RelFileLocator rlocator, ForkNumber forknum,
 						  BlockNumber blkno, const char *page,
 						  XLogRecPtr lsn, uint64 *write_gen_out);
 extern void DWBufFlushFile(int file_idx, uint64 write_gen);
+extern void DWBufBatchSync(int file_idx, uint64 write_gen);
 extern void DWBufFlush(void);
 
 /* Checkpoint batch write support */
