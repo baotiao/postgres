@@ -29,7 +29,8 @@ GUC Control
   double_write_buffer_size = <MB>   (default 64 MB, range 16–1024 MB)
 
 DWB is not a complete replacement for FPW in all paths:
-  - When the DWB ring buffer is full the write falls back to a WAL FPI.
+  - When the DWB ring buffer is full the write blocks until a checkpoint
+    completes and frees space (similar to InnoDB's doublewrite behavior).
   - During online backup (runningBackups > 0) FPW is used regardless.
 
 
@@ -88,7 +89,6 @@ All atomics; no LWLock required for the normal write path.
   file_write_gen[]     -- per-file: incremented by each DWBufWritePage
   file_sync_gen[]      -- per-file: updated to file_write_gen after each fsync
   file_syncing[]       -- per-file CAS lock: 1 while an fsync is in progress
-  overflow_count       -- cumulative count of ring-buffer overflow FPI fallbacks
   num_slots            -- total ring-buffer capacity
   num_files            -- number of segment files
   slots_per_file
@@ -108,13 +108,14 @@ Normal Write Path (DWBufWritePage)
 
 3. Allocate slot: pos = atomic_fetch_add(write_pos, 1)
 
-4. Ring-buffer overflow check:
-     ckpt_start = checkpoint_start_pos
-     if pos - ckpt_start >= num_slots:
-         atomic_fetch_sub(active_writers, 1)
-         atomic_fetch_add(overflow_count, 1)
-         emit DEBUG2 log
-         return -1   -- caller falls back to FPI
+4. Ring-buffer overflow check (blocking wait):
+     loop:
+       pos = atomic_fetch_add(write_pos, 1)
+       ckpt_start = checkpoint_start_pos
+       if pos - ckpt_start < num_slots: break   -- slot is safe
+       atomic_fetch_sub(active_writers, 1)
+       emit DEBUG2 log; CHECK_FOR_INTERRUPTS(); sleep 1 ms
+       re-enter writer registration loop (step 2)
 
 5. Compute physical location:
      slot_pos = pos % num_slots
@@ -135,11 +136,12 @@ Normal Write Path (DWBufWritePage)
 10. Return file_idx.
 
 
-Batch fsync Optimisation (DWBufFlushFile)
-------------------------------------------
+Per-file fsync Optimisation (DWBufFlushFile)
+---------------------------------------------
 
-Non-checkpoint callers (FlushBuffer in bufmgr.c) call DWBufFlushFile(file_idx,
-write_gen) after DWBufWritePage returns.  The optimisation:
+DWBufFlushFile(file_idx, write_gen) ensures a single DWB segment file is
+fsynced up to at least the caller's write generation.  It is used internally
+by both DWBufBatchSync and DWBufFlush (checkpoint path).
 
   fast path: if file_sync_gen[file_idx] >= write_gen → return (no syscall)
 
@@ -152,6 +154,52 @@ write_gen) after DWBufWritePage returns.  The optimisation:
                each iteration]; re-check sync_gen; if still insufficient retry.
 
 A single fsync can satisfy many concurrent writers targeting the same file.
+
+
+Non-Checkpoint Batch Sync (DWBufBatchSync)
+-------------------------------------------
+
+Non-checkpoint callers (FlushBuffer in bufmgr.c) call DWBufBatchSync(file_idx,
+write_gen) after DWBufWritePage returns.  Instead of issuing one fsync per page,
+writers accumulate into a batch:
+
+  1. Early exit if file_idx < 0 (DWBufWritePage returned -1: ring full or
+     DWB disabled).
+
+  2. Atomically increment batch_pending and read batch_complete_count
+     (the writer's "batch epoch").
+
+  3. If batch_pending >= DWBUF_BATCH_SYNC_THRESHOLD (256 pages, ~2 MB),
+     become the leader: fsync all dirty DWB files via DWBufFlushFile,
+     advance batch_complete_count, reset batch_pending, and broadcast on
+     batch_sync_cv.  The advance-before-reset ordering ensures new arrivals
+     between the two steps read the updated epoch and wait for a subsequent
+     batch rather than falsely believing they were covered.
+
+  4. Otherwise, sleep on batch_sync_cv with a timeout of
+     DWBUF_BATCH_SYNC_TIMEOUT_MS (10 ms).  On wakeup, if
+     batch_complete_count has advanced past the value read in step 2 the
+     batch is complete; otherwise (timeout) the waiter promotes itself to
+     leader and performs the fsync as in step 3.
+
+  5. Post-sync verification: after waking, the waiter calls
+     DWBufFlushFile(file_idx, write_gen) to confirm its own write is
+     durable.  A narrow race exists where the leader's scan of
+     file_write_gen misses a writer whose DWBufWritePage completed after
+     the leader scanned that file.  The fast path (file_sync_gen >=
+     write_gen) is a single atomic read with no syscall, so the check is
+     cheap; only the rare edge case triggers an actual fsync.  Leaders
+     skip this check because program order guarantees their own
+     file_write_gen increment is visible to their own scan.
+
+This collapses potentially hundreds of fsyncs into one per batch, similar to
+InnoDB's doublewrite batch.  Under low load the timeout ensures pages are not
+delayed indefinitely.
+
+Checkpoint interaction: DWBufPreCheckpoint broadcasts on batch_sync_cv after
+DWBufFlush.  This wakes any writers blocked in step 4 that would otherwise
+stall for the full 10 ms timeout (no new writers can arrive to reach the
+threshold because resetting == 1).
 
 
 Checkpoint Integration
@@ -192,13 +240,12 @@ BufferSync() Phase 1 (batch DWB write during checkpoint):
 
   Before Phase 2 (the normal dirty-page flush loop), the checkpointer iterates
   all checkpoint-needed buffers and writes them to DWB in bulk, then calls
-  DWBufFlush() once.  This replaces the per-page DWBufWritePage + DWBufFlushFile
+  DWBufFlush() once.  This replaces the per-page DWBufWritePage + DWBufBatchSync
   that FlushBuffer would otherwise do, collapsing N fsyncs into one per segment
   file.
 
-  For pages that return -1 from DWBufWritePage (ring buffer full), Phase 1
-  falls back to log_newpage() + XLogFlush() — the standard WAL FPI path.
-  The per-file fallback count is logged at LOG level when > 0.
+  DWBufWritePage blocks if the ring buffer is full, waiting for a checkpoint
+  to complete and free space.
 
   After Phase 1 sets DWBufCheckpointWritesDone(true), FlushBuffer skips its
   own DWBufWritePage call for checkpoint-needed pages.  The flag is cleared
@@ -263,7 +310,7 @@ Version migration:
   should add a min_version field and clear pg_dwbuf on version mismatch,
   following the pg_wal precedent.
 
-Overflow monitoring:
-  DWBufCtl->overflow_count records cumulative ring-buffer overflows.  A non-zero
-  and growing value indicates double_write_buffer_size is too small.  Future work
-  could expose this counter through pg_stat_io or a dedicated view.
+Ring buffer sizing:
+  When the ring buffer is full, writers block until a checkpoint frees space.
+  If this causes noticeable stalls, increase double_write_buffer_size.  Future
+  work could add a wait-event counter or pg_stat_io metric for monitoring.
